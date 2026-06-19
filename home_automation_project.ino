@@ -46,7 +46,7 @@ const char* WIFI_PASSWORD = "YOUR_WIFI_PASSWORD";
 #define DATABASE_URL "YOUR_FIREBASE_DATABASE_URL"
 #define API_KEY "YOUR_FIREBASE_API_KEY"
 
-ool wifiConnected = false;
+bool wifiConnected = false;
 unsigned long lastWiFiReconnectAttempt = 0;
 const unsigned long WIFI_RECONNECT_INTERVAL = 30000;
 uint8_t wifiFailCount = 0;
@@ -216,6 +216,28 @@ void printFirebaseError(const char* action)
   Serial.print(action);
   Serial.print(F(" failed: "));
   Serial.println(fbdo.errorReason());
+}
+
+const char* getContactorReason()
+{
+  if (sensorFault) return "SENSOR_FAULT";
+  if (batteryVoltage < HARD_BATTERY_CUTOFF) return "HARD_BATTERY_CUTOFF";
+  if (controlContactorManual && contactorOn) return "MANUAL_ON";
+  if (controlContactorManual && !contactorOn) return "MANUAL_OFF_OR_BLOCKED";
+  if (contactorOn && stableGridOn) return "GRID_ON";
+  if (contactorOn && batteryOk) return "BATTERY_OK";
+  if (!contactorOn && !stableGridOn && !batteryOk) return "GRID_OFF_BATTERY_LOW";
+  if (!contactorOn && millis() - lastContactorOffAt < MIN_OFF_TO_ON_INTERVAL) return "ON_DELAY_ACTIVE";
+  return contactorOn ? "ON" : "OFF";
+}
+
+const char* getFanReason()
+{
+  if (controlFanManual && fanOn) return "MANUAL_ON";
+  if (controlFanManual && !fanOn) return "MANUAL_OFF";
+  if (isnan(temperature)) return "TEMP_SENSOR_ERROR";
+  if (fanOn) return "TEMP_HIGH";
+  return "TEMP_NORMAL";
 }
 
 void setupWatchdog()
@@ -652,12 +674,17 @@ void sendLiveStatusToFirebase()
   unsigned long timestamp = getEpochOrUptime();
 
   fbStatusJson.clear();
+  fbStatusJson.set("deviceOnline", true);
+  fbStatusJson.set("wifi", wifiConnected);
+  fbStatusJson.set("firebaseReady", Firebase.ready());
   fbStatusJson.set("battery", displayVoltage);
   fbStatusJson.set("batteryControlVoltage", batteryVoltage);
   if (!isnan(temperature)) fbStatusJson.set("temperature", temperature);
   if (!isnan(humidity)) fbStatusJson.set("humidity", humidity);
   fbStatusJson.set("fan", fanOn);
+  fbStatusJson.set("fanReason", getFanReason());
   fbStatusJson.set("contactor", contactorOn);
+  fbStatusJson.set("contactorReason", getContactorReason());
   fbStatusJson.set("gridStatus", stableGridOn ? "ONLINE" : "OFFLINE");
   fbStatusJson.set("rawGrid", rawGridOn ? "ONLINE" : "OFFLINE");
   fbStatusJson.set("timestamp", (int)timestamp);
@@ -667,6 +694,7 @@ void sendLiveStatusToFirebase()
   if (Firebase.updateNode(fbdo, "/status", fbStatusJson))
   {
     firebaseWriteFailCount = 0;
+    Serial.println(F("[FIREBASE] /status updated."));
   }
   else
   {
@@ -695,6 +723,8 @@ void sendSystemToFirebase()
   fbSystemJson.set("uptimeSec", (int)getUptimeSeconds());
   fbSystemJson.set("firmware", "v4.1.0-reliable");
   fbSystemJson.set("timeValid", isTimeValid());
+  fbSystemJson.set("wifi", wifiConnected);
+  fbSystemJson.set("firebaseReady", Firebase.ready());
   fbSystemJson.set("controlFanManual", controlFanManual);
   fbSystemJson.set("controlContactorManual", controlContactorManual);
   fbSystemJson.set("manualContactorOverrideAllowed", manualOverrideAllowed);
@@ -734,6 +764,8 @@ void sendHistoryToFirebase()
   fbHistoryJson.set("grid", stableGridOn ? "ONLINE" : "OFFLINE");
   fbHistoryJson.set("fan", fanOn);
   fbHistoryJson.set("contactor", contactorOn);
+  fbHistoryJson.set("fanReason", getFanReason());
+  fbHistoryJson.set("contactorReason", getContactorReason());
 
   if (Firebase.updateNode(fbdo, historyPath, fbHistoryJson))
   {
