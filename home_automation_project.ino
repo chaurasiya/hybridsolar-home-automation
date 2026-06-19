@@ -46,7 +46,7 @@ const char* WIFI_PASSWORD = "YOUR_WIFI_PASSWORD";
 #define DATABASE_URL "YOUR_FIREBASE_DATABASE_URL"
 #define API_KEY "YOUR_FIREBASE_API_KEY"
 
-bool wifiConnected = false;
+ool wifiConnected = false;
 unsigned long lastWiFiReconnectAttempt = 0;
 const unsigned long WIFI_RECONNECT_INTERVAL = 30000;
 uint8_t wifiFailCount = 0;
@@ -216,6 +216,35 @@ void printFirebaseError(const char* action)
   Serial.print(action);
   Serial.print(F(" failed: "));
   Serial.println(fbdo.errorReason());
+}
+
+void setupWatchdog()
+{
+  // Arduino ESP32 core 3.x uses the ESP-IDF 5 watchdog API.
+  // Older Arduino ESP32 core 2.x uses the simpler timeout/panic arguments.
+#if ESP_IDF_VERSION_MAJOR >= 5
+  esp_task_wdt_config_t wdtConfig = {};
+  wdtConfig.timeout_ms = 30000;
+  wdtConfig.idle_core_mask = (1 << portNUM_PROCESSORS) - 1;
+  wdtConfig.trigger_panic = true;
+
+  esp_err_t initResult = esp_task_wdt_init(&wdtConfig);
+#else
+  esp_err_t initResult = esp_task_wdt_init(30, true);
+#endif
+
+  if (initResult != ESP_OK && initResult != ESP_ERR_INVALID_STATE)
+  {
+    Serial.print(F("[WDT] Init failed: "));
+    Serial.println((int)initResult);
+  }
+
+  esp_err_t addResult = esp_task_wdt_add(NULL);
+  if (addResult != ESP_OK && addResult != ESP_ERR_INVALID_STATE)
+  {
+    Serial.print(F("[WDT] Add current task failed: "));
+    Serial.println((int)addResult);
+  }
 }
 
 // ==========================
@@ -887,8 +916,7 @@ void setup()
 
   Serial.printf("\n[INIT] ESP32 Booting. Reset Reason: %d\n", systemResetReason);
 
-  esp_task_wdt_init(30, true);
-  esp_task_wdt_add(NULL);
+  setupWatchdog();
 
   pinMode(GRID_PIN, INPUT_PULLUP);
   pinMode(CONTACTOR_PIN, OUTPUT);
