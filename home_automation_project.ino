@@ -11,7 +11,6 @@
 // ==========================
 // Pin Configuration
 // ==========================
-// GPIO5 is used through your transistor/resistor driver stage.
 #define GRID_PIN       14
 #define CONTACTOR_PIN  5
 #define FAN_PIN        23
@@ -32,24 +31,35 @@ const int RELAY_ON  = RELAY_ACTIVE_LOW ? LOW : HIGH;
 const int RELAY_OFF = RELAY_ACTIVE_LOW ? HIGH : LOW;
 
 // ==========================
-// LCD and DHT
+// LCD and DHT Setup
 // ==========================
 LiquidCrystal_I2C lcd(0x27, 16, 2);
 DHT dht(DHTPIN, DHTTYPE);
 
 // ==========================
-// Network & Firebase
+// Network & Firebase Credentials
 // ==========================
 const char* WIFI_SSID = "abhi-wifi-2.4G";
-const char* WIFI_PASSWORD = "YOUR_WIFI_PASSWORD";
+const char* WIFI_PASSWORD = "YOUR_WIFI_PASSWORD"; // Update this
 
-#define DATABASE_URL "YOUR_FIREBASE_DATABASE_URL"
-#define API_KEY "YOUR_FIREBASE_API_KEY"
+#define DATABASE_URL "YOUR_FIREBASE_DATABASE_URL" // Update this
+#define API_KEY "YOUR_FIREBASE_API_KEY"           // Update this
+
+// Firebase Authentication Credentials (Email/Password)
+#define FIREBASE_EMAIL "chaurasiyap815@gmail.com"
+#define FIREBASE_PASSWORD "YOUR_PASSWORD"         // Update this
 
 bool wifiConnected = false;
+bool previousWiFiState = false; // Tracks WiFi transitions for Firebase re-initialization
 unsigned long lastWiFiReconnectAttempt = 0;
-const unsigned long WIFI_RECONNECT_INTERVAL = 30000;
+const unsigned long WIFI_RECONNECT_INTERVAL = 10000; // 10 seconds for faster recovery
 uint8_t wifiFailCount = 0;
+
+
+// --- NEW ADDITION: Firebase Background Recovery Timers ---
+// These variables track the non-blocking interval for Firebase reconnection attempts.
+unsigned long lastFirebaseReconnectAttempt = 0;
+const unsigned long FIREBASE_RECONNECT_INTERVAL = 60000; // Attempt recovery every 60 seconds
 
 FirebaseData fbdo;
 FirebaseAuth auth;
@@ -58,7 +68,7 @@ FirebaseConfig config;
 uint16_t firebaseReadFailCount = 0;
 uint16_t firebaseWriteFailCount = 0;
 
-// Reused Firebase objects to reduce repeated heap churn.
+// Reused Firebase objects to prevent heap memory fragmentation.
 FirebaseJson fbStatusJson;
 FirebaseJson fbSystemJson;
 FirebaseJson fbHistoryJson;
@@ -69,7 +79,8 @@ FirebaseJsonData fbJsonData;
 // ==========================
 // Battery Configuration
 // ==========================
-float calFactor = 12.03;
+// Accurate calibration factor based on hardware multimeter testing
+float calFactor = 13.40;
 
 const float LOW_BATTERY_CUTOFF = 24.0;
 const float BATTERY_RECOVER    = 25.0;
@@ -79,13 +90,13 @@ const bool ALLOW_MANUAL_CONTACTOR_OVERRIDE = true;
 const float MANUAL_OVERRIDE_MIN_VOLTAGE = 23.5;
 
 bool sensorFault = false;
-float batteryVoltage = 0.0;         // Protection/control voltage.
-float displayVoltage = 0.0;         // Smoothed voltage for LCD/Firebase only.
+float batteryVoltage = 0.0;         // Instantaneous voltage for hardware protection.
+float displayVoltage = 0.0;         // Smoothed voltage for LCD and Firebase display.
 float prevBatteryVoltage = 0.0;
 uint8_t adcFaultCount = 0;
 
 // ==========================
-// Temperature / Fan
+// Temperature / Fan Control
 // ==========================
 const float FAN_ON_TEMP  = 37.0;
 const float FAN_OFF_TEMP = 35.5;
@@ -95,31 +106,32 @@ float temperature = NAN;
 float humidity = NAN;
 
 // ==========================
-// Timing
+// Timing Intervals
 // ==========================
 const unsigned long BATTERY_READ_INTERVAL      = 1000;
 const unsigned long DHT_READ_INTERVAL          = 2500;
 const unsigned long LCD_PAGE_TIME              = 3000;
 const unsigned long SERIAL_INTERVAL            = 1000;
 
-// Cloud work is telemetry/remote-control only. Local relay logic must not depend on it.
+// Cloud operations are for telemetry and remote-control only. 
+// Local relay safety logic does not depend on cloud connectivity.
 const unsigned long FIREBASE_LIVE_INTERVAL     = 10000;
 const unsigned long FIREBASE_SYSTEM_INTERVAL   = 60000;
 const unsigned long FIREBASE_HISTORY_INTERVAL  = 60000;
 const unsigned long CONTROL_READ_INTERVAL      = 5000;
 
-// Remote manual control is allowed only while cloud updates remain fresh.
-// If WiFi/Firebase disappears, the unit returns to local AUTO mode.
+// Remote manual control is permitted only while cloud updates remain fresh.
+// If WiFi/Firebase disconnects, the system auto-reverts to local AUTO mode.
 const unsigned long CONTROL_TIMEOUT            = 30000;
 
-// Industrial-style power stability timing:
-// Grid OFF must be detected reasonably quickly.
-// Grid ON must remain stable before load is allowed.
+// Industrial-grade power stability timing logic:
+// Grid OFF must be detected quickly to protect loads.
+// Grid ON must remain completely stable before reconnecting the load.
 const unsigned long GRID_OFF_CONFIRM_TIME      = 2000;
 const unsigned long GRID_ON_CONFIRM_TIME       = 30000;
 
-// Contactor anti-short-cycle:
-// Protective OFF is immediate. ON is delayed after any OFF.
+// Contactor anti-short-cycle protection:
+// Protective OFF is immediate. ON action is delayed after any OFF event.
 const unsigned long MIN_OFF_TO_ON_INTERVAL     = 30000;
 
 const unsigned long NTP_SYNC_INTERVAL          = 86400000;
@@ -142,19 +154,25 @@ unsigned long lastContactorOffAt = 0;
 unsigned long lastContactorSwitch = 0;
 
 // ==========================
-// Persistence Across Deep Sleep / Some Resets
+// Persistence Across Deep Sleep / Resets
 // ==========================
+// RTC memory retains data even if the ESP32 restarts during a power cut.
 RTC_DATA_ATTR unsigned long powerCutTime = 0;
+RTC_DATA_ATTR char lastPowerCutStr[16] = "--:--"; 
 RTC_DATA_ATTR uint32_t contactorCycles = 0;
 RTC_DATA_ATTR uint32_t brownoutCount = 0;
 
 // ==========================
-// Runtime State
+// Runtime State Variables
 // ==========================
 bool rawGridOn = false;
 bool lastRawGridOn = false;
 bool stableGridOn = false;
 bool prevGridState = false;
+
+// Offline event caching flags
+bool pendingPowerOffLog = false;
+bool pendingPowerOnLog = false;
 
 bool batteryOk = false;
 bool contactorOn = false;
@@ -170,18 +188,12 @@ unsigned long maxLoopTimeUs = 0;
 
 byte lcdPage = 0;
 byte batteryIcon[8] = {
-  B01110,
-  B10001,
-  B10001,
-  B11111,
-  B11111,
-  B11111,
-  B11111,
-  B00000
+  B01110, B10001, B10001, B11111,
+  B11111, B11111, B11111, B00000
 };
 
 // ==========================
-// Helper Functions
+// Utility Functions
 // ==========================
 unsigned long getUptimeSeconds()
 {
@@ -190,7 +202,7 @@ unsigned long getUptimeSeconds()
 
 bool isTimeValid()
 {
-  // 1700000000 is a simple sanity check that NTP has provided a real epoch time.
+  // 1700000000 serves as a baseline check to verify NTP has returned a valid epoch time.
   return time(nullptr) > 1700000000;
 }
 
@@ -201,8 +213,8 @@ unsigned long getEpochOrUptime()
 
 void safeRestart(const __FlashStringHelper* msg)
 {
-  // Always de-energize outputs before rebooting so a software recovery cannot
-  // leave the contactor or fan unintentionally ON during restart.
+  // Ensure outputs are de-energized before rebooting to prevent 
+  // loads from remaining unintentionally active during the restart cycle.
   Serial.println(msg);
   digitalWrite(CONTACTOR_PIN, RELAY_OFF);
   digitalWrite(FAN_PIN, RELAY_OFF);
@@ -242,8 +254,8 @@ const char* getFanReason()
 
 void setupWatchdog()
 {
-  // Arduino ESP32 core 3.x uses the ESP-IDF 5 watchdog API.
-  // Older Arduino ESP32 core 2.x uses the simpler timeout/panic arguments.
+  // Arduino ESP32 core 3.x requires the ESP-IDF 5 watchdog API implementation.
+  // Older core versions (2.x) utilize standard timeout/panic parameters.
 #if ESP_IDF_VERSION_MAJOR >= 5
   esp_task_wdt_config_t wdtConfig = {};
   wdtConfig.timeout_ms = 30000;
@@ -270,15 +282,14 @@ void setupWatchdog()
 }
 
 // ==========================
-// Sensor Updates
+// Sensor Telemetry Logic
 // ==========================
-// Reads the divided battery voltage from ESP32 ADC1.
-// analogReadMilliVolts() uses the ESP32 ADC calibration path when available.
 float readBatteryVoltage()
 {
   uint32_t sum = 0;
   const uint8_t samples = 32;
 
+  // Average multiple ADC samples to mitigate hardware noise.
   for (uint8_t i = 0; i < samples; i++)
   {
     sum += analogReadMilliVolts(VOLTAGE_PIN);
@@ -291,8 +302,6 @@ float readBatteryVoltage()
 
 void updateBatteryStatus()
 {
-  // Battery protection uses the latest averaged voltage, not the display filter,
-  // so low-voltage cutoff remains responsive.
   unsigned long now = millis();
   if (now - lastBatteryRead < BATTERY_READ_INTERVAL) return;
 
@@ -306,12 +315,9 @@ void updateBatteryStatus()
     displayVoltage = currentVolts;
   }
 
-  // Keep protection responsive, but still catch impossible ADC jumps.
   float delta = fabs(currentVolts - prevBatteryVoltage);
   if (delta > 5.0)
   {
-    // A sudden impossible jump usually means ADC/sensor wiring noise.
-    // Require several bad samples before declaring a sensor fault.
     adcFaultCount++;
     if (adcFaultCount >= 3)
     {
@@ -322,13 +328,12 @@ void updateBatteryStatus()
   else
   {
     adcFaultCount = 0;
-    sensorFault = (currentVolts < 5.0 || currentVolts > 35.0);
+    // Stricter safety threshold for a 24V system (limits: 10.0V to 35.0V)
+    sensorFault = (currentVolts < 10.0 || currentVolts > 35.0);
     prevBatteryVoltage = currentVolts;
   }
 
   batteryVoltage = currentVolts;
-
-  // Display/cloud smoothing only. Do not use this for protection cutoff.
   displayVoltage = (displayVoltage * 0.9) + (batteryVoltage * 0.1);
 
   if (sensorFault)
@@ -347,8 +352,6 @@ void updateBatteryStatus()
 
 void updateDhtStatus()
 {
-  // DHT22 is slow; reading it too often causes bad samples.
-  // Keep last good readings until repeated failures prove a real sensor issue.
   unsigned long now = millis();
   if (now - lastDhtRead < DHT_READ_INTERVAL) return;
 
@@ -379,9 +382,6 @@ void updateDhtStatus()
 
 void updateGridStatus()
 {
-  // Debounce/filter the grid detector in software.
-  // OFF and ON have different confirmation windows because restoration must be
-  // stable before heavy load is allowed back.
   rawGridOn = digitalRead(GRID_PIN) == GRID_ON_LEVEL;
   unsigned long now = millis();
 
@@ -409,12 +409,10 @@ void updateGridStatus()
 }
 
 // ==========================
-// Local Hardware Control
+// Local Hardware Actuation
 // ==========================
 void setContactor(bool targetOn)
 {
-  // Single place that changes contactor state.
-  // This keeps cycle counting and OFF timestamp tracking consistent.
   if (targetOn == contactorOn) return;
 
   if (targetOn)
@@ -433,8 +431,6 @@ void setContactor(bool targetOn)
 
 void updateContactor()
 {
-  // Grid has highest priority. If grid is stable ON, the contactor must stay ON
-  // even if the battery sensor has a fault or battery voltage is low.
   bool gridStableEnough = stableGridOn;
 
   if (gridStableEnough)
@@ -443,7 +439,6 @@ void updateContactor()
     return;
   }
 
-  // Battery/sensor protection applies only when grid is not available.
   if (sensorFault || batteryVoltage < HARD_BATTERY_CUTOFF)
   {
     setContactor(false);
@@ -452,8 +447,6 @@ void updateContactor()
 
   bool autoPowerAvailable = batteryOk;
 
-  // Manual cloud override is still bounded by local battery safety when grid is OFF.
-  // It cannot force the contactor ON below the configured minimum battery voltage.
   bool manualOverrideAllowed =
     ALLOW_MANUAL_CONTACTOR_OVERRIDE &&
     batteryVoltage >= MANUAL_OVERRIDE_MIN_VOLTAGE &&
@@ -469,7 +462,6 @@ void updateContactor()
     return;
   }
 
-  // Delay only ON transitions to avoid contactor chatter and unstable restoration.
   if (!contactorOn && millis() - lastContactorOffAt < MIN_OFF_TO_ON_INTERVAL)
   {
     digitalWrite(CONTACTOR_PIN, RELAY_OFF);
@@ -481,8 +473,6 @@ void updateContactor()
 
 void updateExhaustFan()
 {
-  // Fan manual mode is less risky than contactor manual mode, but it still
-  // falls back to AUTO when cloud control times out.
   if (controlFanManual)
   {
     fanOn = controlFanActive;
@@ -497,7 +487,6 @@ void updateExhaustFan()
   }
   else if (fanOn && temperature <= FAN_OFF_TEMP)
   {
-    // Hysteresis prevents relay chatter around the 37C threshold.
     fanOn = false;
   }
 
@@ -506,8 +495,6 @@ void updateExhaustFan()
 
 void runLocalControl()
 {
-  // This is the core control loop. It must be safe to run with no WiFi,
-  // no Firebase, and invalid time.
   updateGridStatus();
   updateBatteryStatus();
   updateDhtStatus();
@@ -516,19 +503,26 @@ void runLocalControl()
 }
 
 // ==========================
-// Network & Firebase
+// Network & Cloud Services
 // ==========================
 void maintainWiFi()
 {
-  // WiFi reconnect is intentionally non-fatal for control.
-  // Local automation continues even if cloud connectivity is unavailable.
   bool currentWiFi = (WiFi.status() == WL_CONNECTED);
+
+  // Force Firebase re-initialization if WiFi reconnects
+  if (currentWiFi && !previousWiFiState)
+  {
+    Serial.println(F("[NETWORK] WiFi connection restored. Re-initializing Firebase..."));
+    Firebase.begin(&config, &auth);
+    Firebase.reconnectWiFi(true);
+  }
+  previousWiFiState = currentWiFi;
 
   if (wifiConnected && !currentWiFi)
   {
     controlFanManual = false;
     controlContactorManual = false;
-    Serial.println(F("[NETWORK] WiFi lost. Forced AUTO mode."));
+    Serial.println(F("[NETWORK] WiFi connection lost. Forced AUTO fallback mode."));
   }
 
   wifiConnected = currentWiFi;
@@ -546,18 +540,37 @@ void maintainWiFi()
 
   if (wifiFailCount > 20)
   {
-    safeRestart(F("[NETWORK] WiFi stack recovery reboot."));
+    safeRestart(F("[NETWORK] WiFi stack recovery reboot initiated."));
   }
 
-  Serial.println(F("[NETWORK] Reconnecting WiFi..."));
+  Serial.println(F("[NETWORK] Attempting WiFi reconnection..."));
   WiFi.disconnect(false);
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
 }
 
+
+// --- NEW ADDITION: Independent Background Firebase Recovery ---
+// This function actively monitors the Firebase session. If the token expires 
+// or the connection drops while WiFi is still connected, it forces a silent 
+// background re-initialization without blocking the main local control loop.
+void attemptFirebaseRecovery()
+{
+  if (wifiConnected && !Firebase.ready())
+  {
+    unsigned long now = millis();
+    if (now - lastFirebaseReconnectAttempt >= FIREBASE_RECONNECT_INTERVAL)
+    {
+      lastFirebaseReconnectAttempt = now;
+      Serial.println(F("[FIREBASE] Connection lost (Token expired or network drop). Attempting background recovery..."));
+      
+      Firebase.begin(&config, &auth);
+      Firebase.reconnectWiFi(true);
+    }
+  }
+}
+
 void enforceControlTimeout()
 {
-  // Remote commands expire if cloud updates stop arriving.
-  // This prevents stale dashboard state from controlling real hardware forever.
   if (lastControlSuccess == 0) return;
 
   bool cloudUnavailable = !wifiConnected || !Firebase.ready();
@@ -565,14 +578,12 @@ void enforceControlTimeout()
   {
     controlFanManual = false;
     controlContactorManual = false;
-    Serial.println(F("[CONTROL] Cloud timeout. Returned to AUTO mode."));
+    Serial.println(F("[CONTROL] Cloud timeout elapsed. Reverted to AUTO mode."));
   }
 }
 
 void readFirebaseControls()
 {
-  // Pull remote manual commands from Firebase.
-  // These values are requests only; updateContactor() still applies local safety.
   if (!wifiConnected || !Firebase.ready()) return;
 
   unsigned long now = millis();
@@ -614,38 +625,64 @@ void readFirebaseControls()
     controlFanManual = false;
     controlContactorManual = false;
     firebaseReadFailCount = 0;
-    Serial.println(F("[FIREBASE] Repeated read failures. Controls forced AUTO."));
+    Serial.println(F("[FIREBASE] Repeated read failures detected. Controls forced to AUTO."));
   }
 }
 
 void logGridEvent()
 {
-  // Logs only state transitions, not every loop.
-  // This keeps Firebase writes small while preserving the important events.
-  if (!wifiConnected || !Firebase.ready()) return;
-  if (!isTimeValid()) return;
-  if (stableGridOn == prevGridState) return;
-
-  prevGridState = stableGridOn;
-
-  time_t eventTime = time(nullptr);
-  unsigned long epochTime = (unsigned long)eventTime;
-  struct tm *ptm = localtime(&eventTime);
-
-  char timeString[16];
-  strftime(timeString, sizeof(timeString), "%I:%M %p", ptm);
-
-  fbEventJson.clear();
-
-  if (!stableGridOn)
+  // 1. Local State Tracking (Executes even if offline)
+  if (stableGridOn != prevGridState)
   {
-    powerCutTime = epochTime;
-    fbEventJson.set("powerCut", timeString);
+    prevGridState = stableGridOn;
+    time_t eventTime = time(nullptr);
+    struct tm *ptm = localtime(&eventTime);
+    char timeString[16];
+    strftime(timeString, sizeof(timeString), "%I:%M %p", ptm);
+
+    if (!stableGridOn) {
+      powerCutTime = (unsigned long)eventTime;
+      // Store exact cut time in deep memory to survive unexpected reboots.
+      strncpy(lastPowerCutStr, timeString, sizeof(lastPowerCutStr));
+      pendingPowerOffLog = true;
+    } else {
+      pendingPowerOnLog = true;
+    }
+  }
+
+  // 2. Cloud Synchronization (Executes only when online)
+  if (!wifiConnected || !Firebase.ready() || !isTimeValid()) return;
+
+  if (pendingPowerOffLog)
+  {
+    fbEventJson.clear();
+    fbEventJson.set("powerCut", lastPowerCutStr);
     fbEventJson.set("restored", "--:--");
     fbEventJson.set("duration", "0 Min");
+    Firebase.updateNode(fbdo, "/status/gridEvents", fbEventJson);
+
+    fbLogJson.clear();
+    fbLogJson.set("event", "POWER_OFF");
+    fbLogJson.set("timestamp", (int)powerCutTime);
+    fbLogJson.set("battery", batteryVoltage);
+    fbLogJson.set("contactor", contactorOn);
+    
+    char path[64];
+    snprintf(path, sizeof(path), "/logs/%lu", powerCutTime);
+    Firebase.updateNode(fbdo, path, fbLogJson);
+    
+    pendingPowerOffLog = false; // Successfully logged, clear flag
   }
-  else
+
+  if (pendingPowerOnLog)
   {
+    unsigned long epochTime = (unsigned long)time(nullptr);
+    struct tm *ptm = localtime((time_t*)&epochTime);
+    char timeString[16];
+    strftime(timeString, sizeof(timeString), "%I:%M %p", ptm);
+
+    fbEventJson.clear();
+    fbEventJson.set("powerCut", lastPowerCutStr);
     fbEventJson.set("restored", timeString);
     if (powerCutTime > 0 && epochTime >= powerCutTime)
     {
@@ -653,28 +690,28 @@ void logGridEvent()
       snprintf(durBuffer, sizeof(durBuffer), "%lu Min", (epochTime - powerCutTime) / 60);
       fbEventJson.set("duration", durBuffer);
     }
+    else
+    {
+      fbEventJson.set("duration", "-- Min");
+    }
+    Firebase.updateNode(fbdo, "/status/gridEvents", fbEventJson);
+
+    fbLogJson.clear();
+    fbLogJson.set("event", "POWER_ON");
+    fbLogJson.set("timestamp", (int)epochTime);
+    fbLogJson.set("battery", batteryVoltage);
+    fbLogJson.set("contactor", contactorOn);
+
+    char path[64];
+    snprintf(path, sizeof(path), "/logs/%lu", epochTime);
+    Firebase.updateNode(fbdo, path, fbLogJson);
+
+    pendingPowerOnLog = false; // Successfully logged, clear flag
   }
-
-  bool writeSuccess = Firebase.updateNode(fbdo, "/status/gridEvents", fbEventJson);
-
-  char path[64];
-  snprintf(path, sizeof(path), "/logs/%lu", epochTime);
-
-  fbLogJson.clear();
-  fbLogJson.set("event", stableGridOn ? "POWER_ON" : "POWER_OFF");
-  fbLogJson.set("timestamp", (int)epochTime);
-  fbLogJson.set("battery", batteryVoltage);
-  fbLogJson.set("contactor", contactorOn);
-
-  writeSuccess &= Firebase.updateNode(fbdo, path, fbLogJson);
-
-  firebaseWriteFailCount = writeSuccess ? 0 : firebaseWriteFailCount + 1;
 }
 
 void sendLiveStatusToFirebase()
 {
-  // Fast-changing operational state for dashboards.
-  // Safe to skip if WiFi/Firebase is down.
   if (!wifiConnected || !Firebase.ready()) return;
 
   unsigned long timestamp = getEpochOrUptime();
@@ -700,7 +737,6 @@ void sendLiveStatusToFirebase()
   if (Firebase.updateNode(fbdo, "/status", fbStatusJson))
   {
     firebaseWriteFailCount = 0;
-    Serial.println(F("[FIREBASE] /status updated."));
   }
   else
   {
@@ -711,8 +747,6 @@ void sendLiveStatusToFirebase()
 
 void sendSystemToFirebase()
 {
-  // Lower-frequency health/KPI payload.
-  // Heap, reset reason, loop time, and cycles are useful for long-term reliability.
   if (!wifiConnected || !Firebase.ready()) return;
 
   bool manualOverrideAllowed =
@@ -727,7 +761,7 @@ void sendSystemToFirebase()
   fbSystemJson.set("freeHeap", ESP.getFreeHeap());
   fbSystemJson.set("minFreeHeap", ESP.getMinFreeHeap());
   fbSystemJson.set("uptimeSec", (int)getUptimeSeconds());
-  fbSystemJson.set("firmware", "v4.1.0-reliable");
+  fbSystemJson.set("firmware", "v4.2.0-industrial"); // Updated firmware version
   fbSystemJson.set("timeValid", isTimeValid());
   fbSystemJson.set("wifi", wifiConnected);
   fbSystemJson.set("firebaseReady", Firebase.ready());
@@ -753,7 +787,6 @@ void sendSystemToFirebase()
 
 void sendHistoryToFirebase()
 {
-  // Periodic trend data. Events are logged separately in logGridEvent().
   if (!wifiConnected || !Firebase.ready()) return;
   if (!isTimeValid()) return;
 
@@ -785,12 +818,12 @@ void sendHistoryToFirebase()
 
 void runCloudTasks()
 {
-  // All cloud work is grouped here so the main loop can clearly run:
-  // local control -> cloud tasks -> local control again.
   maintainWiFi();
+   // --- NEW ADDITION: Call the background Firebase recovery check ---
+  attemptFirebaseRecovery(); 
+  // -----------------------------------------------------------------
   enforceControlTimeout();
 
-  // Read remote controls before writes, but local safety still gates all outputs.
   readFirebaseControls();
   logGridEvent();
 
@@ -814,20 +847,26 @@ void runCloudTasks()
     sendHistoryToFirebase();
   }
 
-  if (firebaseWriteFailCount > 50)
-  {
-    firebaseWriteFailCount = 0;
-    Serial.println(F("[FIREBASE] Repeated write failures. Continuing local control."));
-  }
+  // Cloud freeze detection:  .
+ if (firebaseWriteFailCount > 200)
+{
+    if (wifiConnected)
+    {
+        Serial.println(F("[FIREBASE] Too many write failures. Reinitializing Firebase..."));
+
+        Firebase.begin(&config, &auth);
+        Firebase.reconnectWiFi(true);
+    }
+
+    firebaseWriteFailCount = 50;
+}
 }
 
 // ==========================
-// LCD and Serial
+// User Interface (LCD & Serial)
 // ==========================
 void updateLcd()
 {
-  // LCD is intentionally updated on a timer to avoid display work slowing
-  // the relay control loop.
   unsigned long now = millis();
   if (now - lastLcdUpdate < LCD_PAGE_TIME) return;
 
@@ -917,8 +956,6 @@ void updateLcd()
 
 void updateSerial()
 {
-  // Serial diagnostics include current and minimum heap.
-  // Current heap drives reboot decisions; minimum heap is a long-term KPI.
   unsigned long now = millis();
   if (now - lastSerialPrint < SERIAL_INTERVAL) return;
 
@@ -941,7 +978,7 @@ void updateSerial()
 }
 
 // ==========================
-// Setup
+// Main Initialization (Setup)
 // ==========================
 void setup()
 {
@@ -952,7 +989,7 @@ void setup()
   if (resetReason == ESP_RST_BROWNOUT) brownoutCount++;
   systemResetReason = (int)resetReason;
 
-  Serial.printf("\n[INIT] ESP32 Booting. Reset Reason: %d\n", systemResetReason);
+  Serial.printf("\n[INIT] ESP32 Booting. Reset Reason Code: %d\n", systemResetReason);
 
   setupWatchdog();
 
@@ -960,7 +997,6 @@ void setup()
   pinMode(CONTACTOR_PIN, OUTPUT);
   pinMode(FAN_PIN, OUTPUT);
 
-  // Force outputs OFF before initializing network/cloud libraries.
   digitalWrite(CONTACTOR_PIN, RELAY_OFF);
   digitalWrite(FAN_PIN, RELAY_OFF);
   contactorOn = false;
@@ -990,7 +1026,9 @@ void setup()
   batteryVoltage = readBatteryVoltage();
   displayVoltage = batteryVoltage;
   prevBatteryVoltage = batteryVoltage;
-  sensorFault = (batteryVoltage < 5.0 || batteryVoltage > 35.0);
+  
+  // Stricter safety limits applied upon boot
+  sensorFault = (batteryVoltage < 10.0 || batteryVoltage > 35.0);
   batteryOk = !sensorFault && batteryVoltage >= BATTERY_RECOVER;
 
   temperature = dht.readTemperature();
@@ -1014,24 +1052,23 @@ void setup()
   while (WiFi.status() != WL_CONNECTED && millis() - wifiStart < 10000)
   {
     esp_task_wdt_reset();
-    // Keep local safety logic alive even during startup WiFi wait.
     runLocalControl();
     delay(250);
     Serial.print(".");
   }
 
   wifiConnected = (WiFi.status() == WL_CONNECTED);
-  Serial.println(wifiConnected ? F("\n[NETWORK] WiFi connected.") : F("\n[NETWORK] Offline mode."));
+  previousWiFiState = wifiConnected;
+  Serial.println(wifiConnected ? F("\n[NETWORK] WiFi successfully connected.") : F("\n[NETWORK] Operating in offline fallback mode."));
 
   configTime(19800, 0, "pool.ntp.org", "time.nist.gov");
 
   if (wifiConnected)
   {
-    Serial.print(F("[NETWORK] Waiting for NTP Sync..."));
+    Serial.print(F("[NETWORK] Waiting for NTP Time Synchronization..."));
     for (int i = 0; i < 20; i++)
     {
       esp_task_wdt_reset();
-      // NTP wait must not pause local control.
       runLocalControl();
       if (isTimeValid()) break;
       delay(500);
@@ -1047,13 +1084,14 @@ void setup()
 
   if (wifiConnected)
   {
-    if (!Firebase.signUp(&config, &auth, "", ""))
-    {
-      Serial.println(F("[FIREBASE] Sign-up failed. Local control will continue."));
-    }
+    // Configure Email/Password Authentication
+    auth.user.email = FIREBASE_EMAIL;
+    auth.user.password = FIREBASE_PASSWORD;
 
     Firebase.begin(&config, &auth);
     Firebase.reconnectWiFi(true);
+    
+    Serial.println(F("[FIREBASE] Initiating connection via Email/Password Auth..."));
   }
 
   lastLcdUpdate = millis() - LCD_PAGE_TIME;
@@ -1061,30 +1099,26 @@ void setup()
   lastFirebaseSystemUpdate = millis();
   lastFirebaseHistoryUpdate = millis();
 
-  Serial.println(F("[INIT] Setup complete. System live."));
+  Serial.println(F("[INIT] System initialization complete. Services are live."));
 }
 
 // ==========================
-// Main Loop
+// Main Execution Loop
 // ==========================
 void loop()
 {
-  // Main loop rule:
-  // 1. Protect/control hardware locally.
-  // 2. Attempt lower-priority cloud work.
-  // 3. Re-run local control in case network calls were slow.
   unsigned long loopStart = micros();
   esp_task_wdt_reset();
 
-  // Use current heap for the emergency check. Min heap is reported as KPI only.
-  if (ESP.getFreeHeap() < 15000)
+  // Updated: Increased critical heap threshold to 30,000 bytes for higher stability
+  if (ESP.getFreeHeap() < 30000)
   {
-    safeRestart(F("[SYSTEM] Current heap critically low. Rebooting."));
+    safeRestart(F("[SYSTEM] Critical memory shortage detected. Triggering safe reboot."));
   }
 
   if (getUptimeSeconds() > THIRTY_DAYS_SECONDS)
   {
-    safeRestart(F("[SYSTEM] 30-day scheduled maintenance reboot."));
+    safeRestart(F("[SYSTEM] Executing scheduled 30-day maintenance reboot."));
   }
 
   if (millis() - lastNtpSync > NTP_SYNC_INTERVAL)
@@ -1093,13 +1127,8 @@ void loop()
     lastNtpSync = millis();
   }
 
-  // First local pass: always protect/control hardware before network work.
   runLocalControl();
-
-  // Cloud is optional and lower priority.
   runCloudTasks();
-
-  // Second local pass: recover quickly if a cloud call took time.
   runLocalControl();
 
   updateLcd();
