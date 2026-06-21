@@ -69,7 +69,7 @@ FirebaseJsonData fbJsonData;
 // ==========================
 // Battery Configuration
 // ==========================
-float calFactor = 20.05;
+float calFactor = 12.03;
 
 const float LOW_BATTERY_CUTOFF = 24.0;
 const float BATTERY_RECOVER    = 25.0;
@@ -105,7 +105,7 @@ const unsigned long SERIAL_INTERVAL            = 1000;
 // Cloud work is telemetry/remote-control only. Local relay logic must not depend on it.
 const unsigned long FIREBASE_LIVE_INTERVAL     = 10000;
 const unsigned long FIREBASE_SYSTEM_INTERVAL   = 60000;
-const unsigned long FIREBASE_HISTORY_INTERVAL  = 300000;
+const unsigned long FIREBASE_HISTORY_INTERVAL  = 60000;
 const unsigned long CONTROL_READ_INTERVAL      = 5000;
 
 // Remote manual control is allowed only while cloud updates remain fresh.
@@ -120,7 +120,7 @@ const unsigned long GRID_ON_CONFIRM_TIME       = 30000;
 
 // Contactor anti-short-cycle:
 // Protective OFF is immediate. ON is delayed after any OFF.
-const unsigned long MIN_OFF_TO_ON_INTERVAL     = 180000;
+const unsigned long MIN_OFF_TO_ON_INTERVAL     = 30000;
 
 const unsigned long NTP_SYNC_INTERVAL          = 86400000;
 const unsigned long THIRTY_DAYS_SECONDS        = 2592000;
@@ -220,11 +220,11 @@ void printFirebaseError(const char* action)
 
 const char* getContactorReason()
 {
+  if (contactorOn && stableGridOn) return "GRID_ON";
   if (sensorFault) return "SENSOR_FAULT";
   if (batteryVoltage < HARD_BATTERY_CUTOFF) return "HARD_BATTERY_CUTOFF";
   if (controlContactorManual && contactorOn) return "MANUAL_ON";
   if (controlContactorManual && !contactorOn) return "MANUAL_OFF_OR_BLOCKED";
-  if (contactorOn && stableGridOn) return "GRID_ON";
   if (contactorOn && batteryOk) return "BATTERY_OK";
   if (!contactorOn && !stableGridOn && !batteryOk) return "GRID_OFF_BATTERY_LOW";
   if (!contactorOn && millis() - lastContactorOffAt < MIN_OFF_TO_ON_INTERVAL) return "ON_DELAY_ACTIVE";
@@ -433,25 +433,31 @@ void setContactor(bool targetOn)
 
 void updateContactor()
 {
-  // Local safety gates always win over Firebase/manual requests.
+  // Grid has highest priority. If grid is stable ON, the contactor must stay ON
+  // even if the battery sensor has a fault or battery voltage is low.
   bool gridStableEnough = stableGridOn;
 
-  // Immediate protective cutoff. Do not delay OFF for safety decisions.
+  if (gridStableEnough)
+  {
+    setContactor(true);
+    return;
+  }
+
+  // Battery/sensor protection applies only when grid is not available.
   if (sensorFault || batteryVoltage < HARD_BATTERY_CUTOFF)
   {
     setContactor(false);
     return;
   }
 
-  bool autoPowerAvailable = gridStableEnough || batteryOk;
+  bool autoPowerAvailable = batteryOk;
 
-  // Manual cloud override is still bounded by local electrical safety.
-  // It cannot force the contactor ON below the configured minimum voltage.
+  // Manual cloud override is still bounded by local battery safety when grid is OFF.
+  // It cannot force the contactor ON below the configured minimum battery voltage.
   bool manualOverrideAllowed =
-    gridStableEnough ||
-    (ALLOW_MANUAL_CONTACTOR_OVERRIDE &&
-     batteryVoltage >= MANUAL_OVERRIDE_MIN_VOLTAGE &&
-     !sensorFault);
+    ALLOW_MANUAL_CONTACTOR_OVERRIDE &&
+    batteryVoltage >= MANUAL_OVERRIDE_MIN_VOLTAGE &&
+    !sensorFault;
 
   bool targetContactor = controlContactorManual
     ? (controlContactorActive && manualOverrideAllowed)
