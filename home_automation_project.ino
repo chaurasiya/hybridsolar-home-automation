@@ -128,7 +128,7 @@ const unsigned long CONTROL_TIMEOUT            = 30000;
 // Grid OFF must be detected quickly to protect loads.
 // Grid ON must remain completely stable before reconnecting the load.
 const unsigned long GRID_OFF_CONFIRM_TIME      = 2000;
-const unsigned long GRID_ON_CONFIRM_TIME       = 30000;
+const unsigned long GRID_ON_CONFIRM_TIME       = 60000;
 
 // Contactor anti-short-cycle protection:
 // Protective OFF is immediate. ON action is delayed after any OFF event.
@@ -158,6 +158,8 @@ unsigned long lastContactorSwitch = 0;
 // ==========================
 // RTC memory retains data even if the ESP32 restarts during a power cut.
 RTC_DATA_ATTR unsigned long powerCutTime = 0;
+RTC_DATA_ATTR unsigned long powerCutUptimeSeconds = 0;
+RTC_DATA_ATTR bool powerCutTimeValid = false;
 RTC_DATA_ATTR char lastPowerCutStr[16] = "--:--"; 
 RTC_DATA_ATTR uint32_t contactorCycles = 0;
 RTC_DATA_ATTR uint32_t brownoutCount = 0;
@@ -553,12 +555,14 @@ void maintainWiFi()
 // This function actively monitors the Firebase session. If the token expires 
 // or the connection drops while WiFi is still connected, it forces a silent 
 // background re-initialization without blocking the main local control loop.
-void attemptFirebaseRecovery()
+void attemptFirebaseRecovery(bool force = false)
 {
-  if (wifiConnected && !Firebase.ready())
+  if (!wifiConnected) return;
+
+  if (force || !Firebase.ready())
   {
     unsigned long now = millis();
-    if (now - lastFirebaseReconnectAttempt >= FIREBASE_RECONNECT_INTERVAL)
+    if (force || now - lastFirebaseReconnectAttempt >= FIREBASE_RECONNECT_INTERVAL)
     {
       lastFirebaseReconnectAttempt = now;
       Serial.println(F("[FIREBASE] Connection lost (Token expired or network drop). Attempting background recovery..."));
@@ -635,13 +639,26 @@ void logGridEvent()
   if (stableGridOn != prevGridState)
   {
     prevGridState = stableGridOn;
-    time_t eventTime = time(nullptr);
-    struct tm *ptm = localtime(&eventTime);
+
+    bool validEventTime = isTimeValid();
+    unsigned long eventTimestamp = validEventTime ? (unsigned long)time(nullptr) : getUptimeSeconds();
     char timeString[16];
-    strftime(timeString, sizeof(timeString), "%I:%M %p", ptm);
+
+    if (validEventTime)
+    {
+      time_t eventTime = (time_t)eventTimestamp;
+      struct tm *ptm = localtime(&eventTime);
+      strftime(timeString, sizeof(timeString), "%I:%M %p", ptm);
+    }
+    else
+    {
+      strncpy(timeString, "--:--", sizeof(timeString));
+    }
 
     if (!stableGridOn) {
-      powerCutTime = (unsigned long)eventTime;
+      powerCutTime = eventTimestamp;
+      powerCutUptimeSeconds = getUptimeSeconds();
+      powerCutTimeValid = validEventTime;
       // Store exact cut time in deep memory to survive unexpected reboots.
       strncpy(lastPowerCutStr, timeString, sizeof(lastPowerCutStr));
       pendingPowerOffLog = true;
@@ -651,7 +668,7 @@ void logGridEvent()
   }
 
   // 2. Cloud Synchronization (Executes only when online)
-  if (!wifiConnected || !Firebase.ready() || !isTimeValid()) return;
+  if (!wifiConnected || !Firebase.ready()) return;
 
   if (pendingPowerOffLog)
   {
@@ -659,54 +676,99 @@ void logGridEvent()
     fbEventJson.set("powerCut", lastPowerCutStr);
     fbEventJson.set("restored", "--:--");
     fbEventJson.set("duration", "0 Min");
-    Firebase.updateNode(fbdo, "/status/gridEvents", fbEventJson);
 
     fbLogJson.clear();
     fbLogJson.set("event", "POWER_OFF");
     fbLogJson.set("timestamp", (int)powerCutTime);
+    fbLogJson.set("timestampType", powerCutTimeValid ? "epoch" : "uptime");
     fbLogJson.set("battery", batteryVoltage);
     fbLogJson.set("contactor", contactorOn);
     
     char path[64];
-    snprintf(path, sizeof(path), "/logs/%lu", powerCutTime);
-    Firebase.updateNode(fbdo, path, fbLogJson);
+    if (powerCutTimeValid)
+      snprintf(path, sizeof(path), "/logs/%lu", powerCutTime);
+    else
+      snprintf(path, sizeof(path), "/logs/uptime_%lu", powerCutTime);
     
-    pendingPowerOffLog = false; // Successfully logged, clear flag
+    bool writeSuccess = true;
+    writeSuccess &= Firebase.updateNode(fbdo, "/status/gridEvents", fbEventJson);
+    writeSuccess &= Firebase.updateNode(fbdo, path, fbLogJson);
+
+    if (writeSuccess)
+    {
+      pendingPowerOffLog = false; // Successfully logged, clear flag
+      firebaseWriteFailCount = 0;
+    }
+    else
+    {
+      firebaseWriteFailCount++;
+    }
   }
 
   if (pendingPowerOnLog)
   {
-    unsigned long epochTime = (unsigned long)time(nullptr);
-    struct tm *ptm = localtime((time_t*)&epochTime);
+    bool validEventTime = isTimeValid();
+    unsigned long eventTimestamp = validEventTime ? (unsigned long)time(nullptr) : getUptimeSeconds();
+    unsigned long restoreUptimeSeconds = getUptimeSeconds();
     char timeString[16];
-    strftime(timeString, sizeof(timeString), "%I:%M %p", ptm);
+
+    if (validEventTime)
+    {
+      time_t eventTime = (time_t)eventTimestamp;
+      struct tm *ptm = localtime(&eventTime);
+      strftime(timeString, sizeof(timeString), "%I:%M %p", ptm);
+    }
+    else
+    {
+      strncpy(timeString, "--:--", sizeof(timeString));
+    }
 
     fbEventJson.clear();
     fbEventJson.set("powerCut", lastPowerCutStr);
     fbEventJson.set("restored", timeString);
-    if (powerCutTime > 0 && epochTime >= powerCutTime)
+    if (powerCutTimeValid && validEventTime && powerCutTime > 0 && eventTimestamp >= powerCutTime)
     {
       char durBuffer[32];
-      snprintf(durBuffer, sizeof(durBuffer), "%lu Min", (epochTime - powerCutTime) / 60);
+      snprintf(durBuffer, sizeof(durBuffer), "%lu Min", (eventTimestamp - powerCutTime) / 60);
+      fbEventJson.set("duration", durBuffer);
+    }
+    else if (!powerCutTimeValid && restoreUptimeSeconds >= powerCutUptimeSeconds)
+    {
+      char durBuffer[32];
+      snprintf(durBuffer, sizeof(durBuffer), "%lu Min", (restoreUptimeSeconds - powerCutUptimeSeconds) / 60);
       fbEventJson.set("duration", durBuffer);
     }
     else
     {
       fbEventJson.set("duration", "-- Min");
     }
-    Firebase.updateNode(fbdo, "/status/gridEvents", fbEventJson);
 
     fbLogJson.clear();
     fbLogJson.set("event", "POWER_ON");
-    fbLogJson.set("timestamp", (int)epochTime);
+    fbLogJson.set("timestamp", (int)eventTimestamp);
+    fbLogJson.set("timestampType", validEventTime ? "epoch" : "uptime");
     fbLogJson.set("battery", batteryVoltage);
     fbLogJson.set("contactor", contactorOn);
 
     char path[64];
-    snprintf(path, sizeof(path), "/logs/%lu", epochTime);
-    Firebase.updateNode(fbdo, path, fbLogJson);
+    if (validEventTime)
+      snprintf(path, sizeof(path), "/logs/%lu", eventTimestamp);
+    else
+      snprintf(path, sizeof(path), "/logs/uptime_%lu", eventTimestamp);
 
-    pendingPowerOnLog = false; // Successfully logged, clear flag
+    bool writeSuccess = true;
+    writeSuccess &= Firebase.updateNode(fbdo, "/status/gridEvents", fbEventJson);
+    writeSuccess &= Firebase.updateNode(fbdo, path, fbLogJson);
+
+    if (writeSuccess)
+    {
+      pendingPowerOnLog = false; // Successfully logged, clear flag
+      firebaseWriteFailCount = 0;
+    }
+    else
+    {
+      firebaseWriteFailCount++;
+    }
   }
 }
 
@@ -819,9 +881,7 @@ void sendHistoryToFirebase()
 void runCloudTasks()
 {
   maintainWiFi();
-   // --- NEW ADDITION: Call the background Firebase recovery check ---
   attemptFirebaseRecovery(); 
-  // -----------------------------------------------------------------
   enforceControlTimeout();
 
   readFirebaseControls();
@@ -847,19 +907,17 @@ void runCloudTasks()
     sendHistoryToFirebase();
   }
 
-  // Cloud freeze detection:  .
- if (firebaseWriteFailCount > 200)
-{
+  // Force the same recovery path if writes keep failing while WiFi is online.
+  if (firebaseWriteFailCount > 200)
+  {
     if (wifiConnected)
     {
-        Serial.println(F("[FIREBASE] Too many write failures. Reinitializing Firebase..."));
-
-        Firebase.begin(&config, &auth);
-        Firebase.reconnectWiFi(true);
+      Serial.println(F("[FIREBASE] Too many write failures. Forcing recovery..."));
+      attemptFirebaseRecovery(true);
     }
 
     firebaseWriteFailCount = 50;
-}
+  }
 }
 
 // ==========================
@@ -1081,13 +1139,11 @@ void setup()
 
   config.api_key = API_KEY;
   config.database_url = DATABASE_URL;
+  auth.user.email = FIREBASE_EMAIL;
+  auth.user.password = FIREBASE_PASSWORD;
 
   if (wifiConnected)
   {
-    // Configure Email/Password Authentication
-    auth.user.email = FIREBASE_EMAIL;
-    auth.user.password = FIREBASE_PASSWORD;
-
     Firebase.begin(&config, &auth);
     Firebase.reconnectWiFi(true);
     
