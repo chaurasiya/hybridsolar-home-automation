@@ -11,119 +11,204 @@
 // ==========================
 // Pin Configuration
 // ==========================
-#define GRID_PIN       14    
-#define CONTACTOR_PIN  5     
-#define FAN_PIN        23    
-#define VOLTAGE_PIN    35    
+#define GRID_PIN       14
+#define CONTACTOR_PIN  5
+#define FAN_PIN        23
+#define VOLTAGE_PIN    35
 
 #define DHTPIN         16
 #define DHTTYPE        DHT22
 
+// Grid detector logic:
+// LOW  = Grid ON
+// HIGH = Grid OFF
 const int GRID_ON_LEVEL = LOW;
+
+// Relay logic:
+// Set true if your relay driver is active LOW.
 const bool RELAY_ACTIVE_LOW = false;
 const int RELAY_ON  = RELAY_ACTIVE_LOW ? LOW : HIGH;
 const int RELAY_OFF = RELAY_ACTIVE_LOW ? HIGH : LOW;
 
+// ==========================
+// LCD and DHT Setup
+// ==========================
 LiquidCrystal_I2C lcd(0x27, 16, 2);
 DHT dht(DHTPIN, DHTTYPE);
 
 // ==========================
-// Network & API (Your Originals Maintained)
+// Network & Firebase Credentials
 // ==========================
 const char* WIFI_SSID = "abhi-wifi-2.4G";
-const char* WIFI_PASSWORD = "YOUR_WIFI_PASSWORD";
+const char* WIFI_PASSWORD = "YOUR_WIFI_PASSWORD"; // Update this
 
-#define DATABASE_URL "YOUR_FIREBASE_DATABASE_URL"
-#define API_KEY "YOUR_FIREBASE_API_KEY"
+#define DATABASE_URL "YOUR_FIREBASE_DATABASE_URL" // Update this
+#define API_KEY "YOUR_FIREBASE_API_KEY"           // Update this
+
+// Firebase Authentication Credentials (Email/Password)
+#define FIREBASE_EMAIL "chaurasiyap815@gmail.com"
+#define FIREBASE_PASSWORD "YOUR_PASSWORD"         // Update this
 
 bool wifiConnected = false;
+bool previousWiFiState = false; // Tracks WiFi transitions for Firebase re-initialization
 unsigned long lastWiFiReconnectAttempt = 0;
-const unsigned long WIFI_RECONNECT_INTERVAL = 30000;
+const unsigned long WIFI_RECONNECT_INTERVAL = 10000; // 10 seconds for faster recovery
 uint8_t wifiFailCount = 0;
 
 FirebaseData fbdo;
 FirebaseAuth auth;
 FirebaseConfig config;
+
 uint16_t firebaseReadFailCount = 0;
 uint16_t firebaseWriteFailCount = 0;
+
+// Reused Firebase objects to prevent heap memory fragmentation.
+FirebaseJson fbStatusJson;
+FirebaseJson fbSystemJson;
+FirebaseJson fbHistoryJson;
+FirebaseJson fbEventJson;
+FirebaseJson fbLogJson;
+FirebaseJsonData fbJsonData;
 
 // ==========================
 // Battery Configuration
 // ==========================
-float calFactor = 20.05; 
+// Accurate calibration factor based on hardware multimeter testing
+float calFactor = 13.40;
+
 const float LOW_BATTERY_CUTOFF = 24.0;
 const float BATTERY_RECOVER    = 25.0;
+const float HARD_BATTERY_CUTOFF = 23.5;
 
 const bool ALLOW_MANUAL_CONTACTOR_OVERRIDE = true;
-const float MANUAL_OVERRIDE_MIN_VOLTAGE = 23.5; 
+const float MANUAL_OVERRIDE_MIN_VOLTAGE = 23.5;
 
 bool sensorFault = false;
-float prevBatteryVoltage = 0.0; 
-float filteredVoltage = 0.0; // [FIX] Initialized to 0.0
+float batteryVoltage = 0.0;         // Instantaneous voltage for hardware protection.
+float displayVoltage = 0.0;         // Smoothed voltage for LCD and Firebase display.
+float prevBatteryVoltage = 0.0;
 uint8_t adcFaultCount = 0;
 
 // ==========================
-// Timers & Delays
+// Temperature / Fan Control
 // ==========================
 const float FAN_ON_TEMP  = 37.0;
 const float FAN_OFF_TEMP = 35.5;
 uint8_t dhtFailCount = 0;
 
-const unsigned long BATTERY_READ_INTERVAL   = 1000;
-const unsigned long DHT_READ_INTERVAL       = 2500;
-const unsigned long LCD_PAGE_TIME           = 3000;
-const unsigned long SERIAL_INTERVAL         = 1000;
-const unsigned long FIREBASE_LIVE_INTERVAL  = 5000;
-const unsigned long FIREBASE_HISTORY_INTERVAL = 60000; 
-const unsigned long CONTROL_READ_INTERVAL   = 2000;
-const unsigned long CONTROL_TIMEOUT         = 30000; 
-const unsigned long CONTACTOR_DELAY         = 3000; 
-const unsigned long NTP_SYNC_INTERVAL       = 86400000; 
+float temperature = NAN;
+float humidity = NAN;
 
-const unsigned long MIN_OFF_TO_ON_INTERVAL  = 5000;  
-const unsigned long MIN_ON_TO_OFF_INTERVAL  = 30000; 
-const unsigned long THIRTY_DAYS_SECONDS     = 2592000; 
+// ==========================
+// Timing Intervals
+// ==========================
+const unsigned long BATTERY_READ_INTERVAL      = 1000;
+const unsigned long DHT_READ_INTERVAL          = 2500;
+const unsigned long LCD_PAGE_TIME              = 3000;
+const unsigned long SERIAL_INTERVAL            = 1000;
 
-unsigned long lastBatteryRead = 0, lastDhtRead = 0, lastLcdUpdate = 0, lastSerialPrint = 0;
-unsigned long lastFirebaseLiveUpdate = 0, lastFirebaseHistoryUpdate = 0;
-unsigned long lastControlRead = 0, lastControlSuccess = 0;
-unsigned long gridRestoredAt = 0, lastContactorSwitch = 0, lastNtpSync = 0;
+// Cloud operations are for telemetry and remote-control only. 
+// Local relay safety logic does not depend on cloud connectivity.
+const unsigned long FIREBASE_LIVE_INTERVAL     = 10000;
+const unsigned long FIREBASE_SYSTEM_INTERVAL   = 60000;
+const unsigned long FIREBASE_HISTORY_INTERVAL  = 60000;
+const unsigned long CONTROL_READ_INTERVAL      = 5000;
 
-const unsigned long GRID_ON_CONFIRM_TIME  = 5000;
-const unsigned long GRID_OFF_CONFIRM_TIME = 5000;
+// Remote manual control is permitted only while cloud updates remain fresh.
+// If WiFi/Firebase disconnects, the system auto-reverts to local AUTO mode.
+const unsigned long CONTROL_TIMEOUT            = 30000;
 
-bool rawGridOn = false, lastRawGridOn = false, stableGridOn = false, prevGridState = false;
+// Industrial-grade power stability timing logic:
+// Grid OFF must be detected quickly to protect loads.
+// Grid ON must remain completely stable before reconnecting the load.
+const unsigned long GRID_OFF_CONFIRM_TIME      = 2000;
+const unsigned long GRID_ON_CONFIRM_TIME       = 30000;
+
+// Contactor anti-short-cycle protection:
+// Protective OFF is immediate. ON action is delayed after any OFF event.
+const unsigned long MIN_OFF_TO_ON_INTERVAL     = 30000;
+
+const unsigned long NTP_SYNC_INTERVAL          = 86400000;
+const unsigned long THIRTY_DAYS_SECONDS        = 2592000;
+
+unsigned long lastBatteryRead = 0;
+unsigned long lastDhtRead = 0;
+unsigned long lastLcdUpdate = 0;
+unsigned long lastSerialPrint = 0;
+unsigned long lastFirebaseLiveUpdate = 0;
+unsigned long lastFirebaseSystemUpdate = 0;
+unsigned long lastFirebaseHistoryUpdate = 0;
+unsigned long lastControlRead = 0;
+unsigned long lastControlSuccess = 0;
+unsigned long lastNtpSync = 0;
+
 unsigned long rawGridChangedAt = 0;
+unsigned long gridRestoredAt = 0;
+unsigned long lastContactorOffAt = 0;
+unsigned long lastContactorSwitch = 0;
 
 // ==========================
-// Persistence (RTC Memory)
+// Persistence Across Deep Sleep / Resets
 // ==========================
+// RTC memory retains data even if the ESP32 restarts during a power cut.
 RTC_DATA_ATTR unsigned long powerCutTime = 0;
-RTC_DATA_ATTR uint32_t contactorCycles = 0; 
-RTC_DATA_ATTR uint32_t brownoutCount = 0;   
+RTC_DATA_ATTR char lastPowerCutStr[16] = "--:--"; 
+RTC_DATA_ATTR uint32_t contactorCycles = 0;
+RTC_DATA_ATTR uint32_t brownoutCount = 0;
 
 // ==========================
-// System Runtime State
+// Runtime State Variables
 // ==========================
-float batteryVoltage = 0.0, temperature = NAN, humidity = NAN;
-bool batteryOk = false, contactorOn = false, fanOn = false;
-bool controlFanManual = false, controlFanActive = false;
-bool controlContactorManual = false, controlContactorActive = false;
+bool rawGridOn = false;
+bool lastRawGridOn = false;
+bool stableGridOn = false;
+bool prevGridState = false;
+
+// Offline event caching flags
+bool pendingPowerOffLog = false;
+bool pendingPowerOnLog = false;
+
+bool batteryOk = false;
+bool contactorOn = false;
+bool fanOn = false;
+
+bool controlFanManual = false;
+bool controlFanActive = false;
+bool controlContactorManual = false;
+bool controlContactorActive = false;
 
 int systemResetReason = 0;
 unsigned long maxLoopTimeUs = 0;
 
 byte lcdPage = 0;
-byte batteryIcon[8] = { B01110, B10001, B10001, B11111, B11111, B11111, B11111, B00000 };
+byte batteryIcon[8] = {
+  B01110, B10001, B10001, B11111,
+  B11111, B11111, B11111, B00000
+};
 
 // ==========================
-// Helper Functions
+// Utility Functions
 // ==========================
-unsigned long getUptimeSeconds() { return millis() / 1000; }
-bool isTimeValid() { return time(nullptr) > 1700000000; }
-unsigned long getEpochOrUptime() { return isTimeValid() ? (unsigned long)time(nullptr) : getUptimeSeconds(); }
+unsigned long getUptimeSeconds()
+{
+  return millis() / 1000;
+}
 
-void safeRestart(const __FlashStringHelper* msg) {
+bool isTimeValid()
+{
+  // 1700000000 serves as a baseline check to verify NTP has returned a valid epoch time.
+  return time(nullptr) > 1700000000;
+}
+
+unsigned long getEpochOrUptime()
+{
+  return isTimeValid() ? (unsigned long)time(nullptr) : getUptimeSeconds();
+}
+
+void safeRestart(const __FlashStringHelper* msg)
+{
+  // Ensure outputs are de-energized before rebooting to prevent 
+  // loads from remaining unintentionally active during the restart cycle.
   Serial.println(msg);
   digitalWrite(CONTACTOR_PIN, RELAY_OFF);
   digitalWrite(FAN_PIN, RELAY_OFF);
@@ -131,126 +216,312 @@ void safeRestart(const __FlashStringHelper* msg) {
   ESP.restart();
 }
 
-void printFirebaseError(const char* action) {
+void printFirebaseError(const char* action)
+{
   Serial.print(F("[FIREBASE] "));
   Serial.print(action);
   Serial.print(F(" failed: "));
   Serial.println(fbdo.errorReason());
 }
 
-// ==========================
-// Sensor Updates
-// ==========================
-float readBatteryVoltage() {
-  uint32_t sum = 0;
-  const uint8_t samples = 32; 
-  for (uint8_t i = 0; i < samples; i++) {
-    sum += analogReadMilliVolts(VOLTAGE_PIN); 
-    delayMicroseconds(200); 
-  }
-  float avgMilliVolts = sum / float(samples);
-  return (avgMilliVolts / 1000.0) * calFactor; 
+const char* getContactorReason()
+{
+  if (contactorOn && stableGridOn) return "GRID_ON";
+  if (sensorFault) return "SENSOR_FAULT";
+  if (batteryVoltage < HARD_BATTERY_CUTOFF) return "HARD_BATTERY_CUTOFF";
+  if (controlContactorManual && contactorOn) return "MANUAL_ON";
+  if (controlContactorManual && !contactorOn) return "MANUAL_OFF_OR_BLOCKED";
+  if (contactorOn && batteryOk) return "BATTERY_OK";
+  if (!contactorOn && !stableGridOn && !batteryOk) return "GRID_OFF_BATTERY_LOW";
+  if (!contactorOn && millis() - lastContactorOffAt < MIN_OFF_TO_ON_INTERVAL) return "ON_DELAY_ACTIVE";
+  return contactorOn ? "ON" : "OFF";
 }
 
-void updateBatteryStatus() {
+const char* getFanReason()
+{
+  if (controlFanManual && fanOn) return "MANUAL_ON";
+  if (controlFanManual && !fanOn) return "MANUAL_OFF";
+  if (isnan(temperature)) return "TEMP_SENSOR_ERROR";
+  if (fanOn) return "TEMP_HIGH";
+  return "TEMP_NORMAL";
+}
+
+void setupWatchdog()
+{
+  // Arduino ESP32 core 3.x requires the ESP-IDF 5 watchdog API implementation.
+  // Older core versions (2.x) utilize standard timeout/panic parameters.
+#if ESP_IDF_VERSION_MAJOR >= 5
+  esp_task_wdt_config_t wdtConfig = {};
+  wdtConfig.timeout_ms = 30000;
+  wdtConfig.idle_core_mask = (1 << portNUM_PROCESSORS) - 1;
+  wdtConfig.trigger_panic = true;
+
+  esp_err_t initResult = esp_task_wdt_init(&wdtConfig);
+#else
+  esp_err_t initResult = esp_task_wdt_init(30, true);
+#endif
+
+  if (initResult != ESP_OK && initResult != ESP_ERR_INVALID_STATE)
+  {
+    Serial.print(F("[WDT] Init failed: "));
+    Serial.println((int)initResult);
+  }
+
+  esp_err_t addResult = esp_task_wdt_add(NULL);
+  if (addResult != ESP_OK && addResult != ESP_ERR_INVALID_STATE)
+  {
+    Serial.print(F("[WDT] Add current task failed: "));
+    Serial.println((int)addResult);
+  }
+}
+
+// ==========================
+// Sensor Telemetry Logic
+// ==========================
+float readBatteryVoltage()
+{
+  uint32_t sum = 0;
+  const uint8_t samples = 32;
+
+  // Average multiple ADC samples to mitigate hardware noise.
+  for (uint8_t i = 0; i < samples; i++)
+  {
+    sum += analogReadMilliVolts(VOLTAGE_PIN);
+    delayMicroseconds(200);
+  }
+
+  float avgMilliVolts = sum / float(samples);
+  return (avgMilliVolts / 1000.0) * calFactor;
+}
+
+void updateBatteryStatus()
+{
   unsigned long now = millis();
   if (now - lastBatteryRead < BATTERY_READ_INTERVAL) return;
 
   lastBatteryRead = now;
+
   float currentVolts = readBatteryVoltage();
-  
-  if (prevBatteryVoltage == 0.0) {
-      prevBatteryVoltage = currentVolts; 
-      filteredVoltage = currentVolts;
+
+  if (prevBatteryVoltage == 0.0)
+  {
+    prevBatteryVoltage = currentVolts;
+    displayVoltage = currentVolts;
   }
-  
-  filteredVoltage = (filteredVoltage * 0.9) + (currentVolts * 0.1);
-  currentVolts = filteredVoltage;
-  
+
   float delta = fabs(currentVolts - prevBatteryVoltage);
-  
-  if (delta > 5.0) {
-      adcFaultCount++;
-      if (adcFaultCount >= 3) {
-          sensorFault = true;
-          prevBatteryVoltage = currentVolts; 
-      }
-  } else {
-      adcFaultCount = 0;
-      sensorFault = (currentVolts < 5.0 || currentVolts > 35.0);
+  if (delta > 5.0)
+  {
+    adcFaultCount++;
+    if (adcFaultCount >= 3)
+    {
+      sensorFault = true;
       prevBatteryVoltage = currentVolts;
+    }
+  }
+  else
+  {
+    adcFaultCount = 0;
+    // Stricter safety threshold for a 24V system (limits: 10.0V to 35.0V)
+    sensorFault = (currentVolts < 10.0 || currentVolts > 35.0);
+    prevBatteryVoltage = currentVolts;
   }
 
   batteryVoltage = currentVolts;
+  displayVoltage = (displayVoltage * 0.9) + (batteryVoltage * 0.1);
 
-  if (sensorFault) {
+  if (sensorFault)
+  {
     batteryOk = false;
-  } else {
-    if (batteryVoltage < LOW_BATTERY_CUTOFF) batteryOk = false;
-    else if (batteryVoltage >= BATTERY_RECOVER) batteryOk = true;
+  }
+  else if (batteryVoltage < LOW_BATTERY_CUTOFF)
+  {
+    batteryOk = false;
+  }
+  else if (batteryVoltage >= BATTERY_RECOVER)
+  {
+    batteryOk = true;
   }
 }
 
-void updateDhtStatus() {
+void updateDhtStatus()
+{
   unsigned long now = millis();
   if (now - lastDhtRead < DHT_READ_INTERVAL) return;
 
   lastDhtRead = now;
+
   float newTemp = dht.readTemperature();
   float newHum  = dht.readHumidity();
 
-  if (isnan(newTemp) || isnan(newHum)) {
+  if (isnan(newTemp) || isnan(newHum))
+  {
     dhtFailCount++;
-    // [FIX] Fast DHT Recovery
-    if (dhtFailCount > 5) {
-      temperature = NAN; 
+    if (dhtFailCount > 5)
+    {
+      temperature = NAN;
       humidity = NAN;
+      fanOn = false;
       dht.begin();
       dhtFailCount = 0;
     }
-  } else {
+  }
+  else
+  {
     dhtFailCount = 0;
     temperature = newTemp;
     humidity = newHum;
   }
 }
 
-void updateGridStatus() {
+void updateGridStatus()
+{
   rawGridOn = digitalRead(GRID_PIN) == GRID_ON_LEVEL;
   unsigned long now = millis();
 
-  if (rawGridOn != lastRawGridOn) {
+  if (rawGridOn != lastRawGridOn)
+  {
     lastRawGridOn = rawGridOn;
     rawGridChangedAt = now;
   }
 
   unsigned long stableTime = now - rawGridChangedAt;
-  
-  if (rawGridOn && stableTime >= GRID_ON_CONFIRM_TIME) {
-    if (!stableGridOn) {
+
+  if (rawGridOn && stableTime >= GRID_ON_CONFIRM_TIME)
+  {
+    if (!stableGridOn)
+    {
       stableGridOn = true;
-      gridRestoredAt = millis(); 
+      gridRestoredAt = now;
     }
   }
-  if (!rawGridOn && stableTime >= GRID_OFF_CONFIRM_TIME) {
+
+  if (!rawGridOn && stableTime >= GRID_OFF_CONFIRM_TIME)
+  {
     stableGridOn = false;
   }
 }
 
 // ==========================
-// Network & Firebase Logic
+// Local Hardware Actuation
 // ==========================
-void maintainWiFi() {
+void setContactor(bool targetOn)
+{
+  if (targetOn == contactorOn) return;
+
+  if (targetOn)
+  {
+    contactorCycles++;
+  }
+  else
+  {
+    lastContactorOffAt = millis();
+  }
+
+  contactorOn = targetOn;
+  lastContactorSwitch = millis();
+  digitalWrite(CONTACTOR_PIN, contactorOn ? RELAY_ON : RELAY_OFF);
+}
+
+void updateContactor()
+{
+  bool gridStableEnough = stableGridOn;
+
+  if (gridStableEnough)
+  {
+    setContactor(true);
+    return;
+  }
+
+  if (sensorFault || batteryVoltage < HARD_BATTERY_CUTOFF)
+  {
+    setContactor(false);
+    return;
+  }
+
+  bool autoPowerAvailable = batteryOk;
+
+  bool manualOverrideAllowed =
+    ALLOW_MANUAL_CONTACTOR_OVERRIDE &&
+    batteryVoltage >= MANUAL_OVERRIDE_MIN_VOLTAGE &&
+    !sensorFault;
+
+  bool targetContactor = controlContactorManual
+    ? (controlContactorActive && manualOverrideAllowed)
+    : autoPowerAvailable;
+
+  if (!targetContactor)
+  {
+    setContactor(false);
+    return;
+  }
+
+  if (!contactorOn && millis() - lastContactorOffAt < MIN_OFF_TO_ON_INTERVAL)
+  {
+    digitalWrite(CONTACTOR_PIN, RELAY_OFF);
+    return;
+  }
+
+  setContactor(true);
+}
+
+void updateExhaustFan()
+{
+  if (controlFanManual)
+  {
+    fanOn = controlFanActive;
+  }
+  else if (isnan(temperature))
+  {
+    fanOn = false;
+  }
+  else if (!fanOn && temperature > FAN_ON_TEMP)
+  {
+    fanOn = true;
+  }
+  else if (fanOn && temperature <= FAN_OFF_TEMP)
+  {
+    fanOn = false;
+  }
+
+  digitalWrite(FAN_PIN, fanOn ? RELAY_ON : RELAY_OFF);
+}
+
+void runLocalControl()
+{
+  updateGridStatus();
+  updateBatteryStatus();
+  updateDhtStatus();
+  updateContactor();
+  updateExhaustFan();
+}
+
+// ==========================
+// Network & Cloud Services
+// ==========================
+void maintainWiFi()
+{
   bool currentWiFi = (WiFi.status() == WL_CONNECTED);
 
-  if (wifiConnected && !currentWiFi) {
+  // Force Firebase re-initialization if WiFi reconnects
+  if (currentWiFi && !previousWiFiState)
+  {
+    Serial.println(F("[NETWORK] WiFi connection restored. Re-initializing Firebase..."));
+    Firebase.begin(&config, &auth);
+    Firebase.reconnectWiFi(true);
+  }
+  previousWiFiState = currentWiFi;
+
+  if (wifiConnected && !currentWiFi)
+  {
     controlFanManual = false;
     controlContactorManual = false;
-    Serial.println(F("[NETWORK] WiFi lost! Forced AUTO mode."));
+    Serial.println(F("[NETWORK] WiFi connection lost. Forced AUTO fallback mode."));
   }
 
   wifiConnected = currentWiFi;
-  if (wifiConnected) {
+  if (wifiConnected)
+  {
     wifiFailCount = 0;
     return;
   }
@@ -260,309 +531,439 @@ void maintainWiFi() {
 
   lastWiFiReconnectAttempt = now;
   wifiFailCount++;
-  
-  if (wifiFailCount > 20) {
-    safeRestart(F("[NETWORK] WiFi stack dead. Rebooting system..."));
+
+  if (wifiFailCount > 20)
+  {
+    safeRestart(F("[NETWORK] WiFi stack recovery reboot initiated."));
   }
 
-  Serial.println(F("[NETWORK] Reconnecting WiFi..."));
+  Serial.println(F("[NETWORK] Attempting WiFi reconnection..."));
   WiFi.disconnect(false);
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
 }
 
-void enforceControlTimeout() {
+void enforceControlTimeout()
+{
   if (lastControlSuccess == 0) return;
-  bool cloudUnavailable = !wifiConnected || !Firebase.ready();
 
-  if (cloudUnavailable && millis() - lastControlSuccess > CONTROL_TIMEOUT) {
+  bool cloudUnavailable = !wifiConnected || !Firebase.ready();
+  if (cloudUnavailable && millis() - lastControlSuccess > CONTROL_TIMEOUT)
+  {
     controlFanManual = false;
     controlContactorManual = false;
-    Serial.println(F("[CONTROL] Cloud timeout. Returned to AUTO mode."));
+    Serial.println(F("[CONTROL] Cloud timeout elapsed. Reverted to AUTO mode."));
   }
 }
 
-void readFirebaseControls() {
+void readFirebaseControls()
+{
   if (!wifiConnected || !Firebase.ready()) return;
 
   unsigned long now = millis();
   if (now - lastControlRead < CONTROL_READ_INTERVAL) return;
   lastControlRead = now;
 
-  unsigned long fbStart = millis(); 
-  
-  if (Firebase.getJSON(fbdo, "/control")) {
-      FirebaseJsonData jsonData;
-      FirebaseJson& json = fbdo.jsonObject();
+  if (Firebase.getJSON(fbdo, "/control"))
+  {
+    FirebaseJson& json = fbdo.jsonObject();
 
-      json.get(jsonData, "fan/manual");
-      if (jsonData.success) controlFanManual = jsonData.boolValue;
+    json.get(fbJsonData, "fan/manual");
+    if (fbJsonData.success) controlFanManual = fbJsonData.boolValue;
 
-      json.get(jsonData, "fan/active");
-      if (jsonData.success) controlFanActive = jsonData.boolValue;
+    json.get(fbJsonData, "fan/active");
+    if (fbJsonData.success) controlFanActive = fbJsonData.boolValue;
 
-      json.get(jsonData, "contactor/manual");
-      if (jsonData.success) controlContactorManual = jsonData.boolValue;
+    json.get(fbJsonData, "contactor/manual");
+    if (fbJsonData.success) controlContactorManual = fbJsonData.boolValue;
 
-      json.get(jsonData, "contactor/active");
-      if (jsonData.success) controlContactorActive = jsonData.boolValue;
+    json.get(fbJsonData, "contactor/active");
+    if (fbJsonData.success) controlContactorActive = fbJsonData.boolValue;
 
-      lastControlSuccess = now;
-      firebaseReadFailCount = 0;
-  } else {
-      firebaseReadFailCount++;
+    lastControlSuccess = now;
+    firebaseReadFailCount = 0;
+  }
+  else
+  {
+    firebaseReadFailCount++;
   }
 
-  if (Firebase.getFloat(fbdo, "/settings/calFactor")) {
-     float newCal = fbdo.floatData();
-     if (newCal > 10.0 && newCal < 40.0) calFactor = newCal;
+  if (Firebase.getFloat(fbdo, "/settings/calFactor"))
+  {
+    float newCal = fbdo.floatData();
+    if (newCal > 10.0 && newCal < 40.0) calFactor = newCal;
   }
 
-  if (millis() - fbStart > 2000) Serial.println(F("[WARNING] Slow Firebase Read"));
-
-  if (firebaseReadFailCount > 50) {
-    safeRestart(F("[FIREBASE] Read Deadlock. Rebooting..."));
+  if (firebaseReadFailCount > 50)
+  {
+    controlFanManual = false;
+    controlContactorManual = false;
+    firebaseReadFailCount = 0;
+    Serial.println(F("[FIREBASE] Repeated read failures detected. Controls forced to AUTO."));
   }
 }
 
-// ==========================
-// Hardware Control
-// ==========================
-void updateContactor() {
-  bool gridSafe = stableGridOn && (millis() - gridRestoredAt >= CONTACTOR_DELAY);
-  
-  // [FIX] Emergency Hard Cutoff to protect battery from deep discharge
-  if (!gridSafe && batteryVoltage < 23.5) {
-      contactorOn = false;
-      digitalWrite(CONTACTOR_PIN, RELAY_OFF);
-      return; 
-  }
+void logGridEvent()
+{
+  // 1. Local State Tracking (Executes even if offline)
+  if (stableGridOn != prevGridState)
+  {
+    prevGridState = stableGridOn;
+    time_t eventTime = time(nullptr);
+    struct tm *ptm = localtime(&eventTime);
+    char timeString[16];
+    strftime(timeString, sizeof(timeString), "%I:%M %p", ptm);
 
-  bool autoPowerAvailable = gridSafe || (batteryOk && !sensorFault);
-  bool manualOverrideAllowed = gridSafe || (ALLOW_MANUAL_CONTACTOR_OVERRIDE && batteryVoltage >= MANUAL_OVERRIDE_MIN_VOLTAGE && !sensorFault);
-
-  bool targetContactor = false;
-
-  if (controlContactorManual) {
-    targetContactor = controlContactorActive && manualOverrideAllowed;
-  } else {
-    targetContactor = autoPowerAvailable;
-  }
-
-  if (targetContactor != contactorOn) {
-    unsigned long requiredDelay = targetContactor ? MIN_OFF_TO_ON_INTERVAL : MIN_ON_TO_OFF_INTERVAL;
-    
-    if (millis() - lastContactorSwitch > requiredDelay) {
-      // [FIX] Count ONLY 'ON' transitions
-      if (targetContactor && !contactorOn) {
-          contactorCycles++;
-      }
-      contactorOn = targetContactor;
-      lastContactorSwitch = millis();
+    if (!stableGridOn) {
+      powerCutTime = (unsigned long)eventTime;
+      // Store exact cut time in deep memory to survive unexpected reboots.
+      strncpy(lastPowerCutStr, timeString, sizeof(lastPowerCutStr));
+      pendingPowerOffLog = true;
+    } else {
+      pendingPowerOnLog = true;
     }
   }
 
-  digitalWrite(CONTACTOR_PIN, contactorOn ? RELAY_ON : RELAY_OFF);
-}
+  // 2. Cloud Synchronization (Executes only when online)
+  if (!wifiConnected || !Firebase.ready() || !isTimeValid()) return;
 
-void updateExhaustFan() {
-  if (controlFanManual) {
-    fanOn = controlFanActive;
-  } else {
-    if (isnan(temperature)) fanOn = false;
-    else if (!fanOn && temperature > FAN_ON_TEMP) fanOn = true;
-    else if (fanOn && temperature <= FAN_OFF_TEMP) fanOn = false;
+  if (pendingPowerOffLog)
+  {
+    fbEventJson.clear();
+    fbEventJson.set("powerCut", lastPowerCutStr);
+    fbEventJson.set("restored", "--:--");
+    fbEventJson.set("duration", "0 Min");
+    Firebase.updateNode(fbdo, "/status/gridEvents", fbEventJson);
+
+    fbLogJson.clear();
+    fbLogJson.set("event", "POWER_OFF");
+    fbLogJson.set("timestamp", (int)powerCutTime);
+    fbLogJson.set("battery", batteryVoltage);
+    fbLogJson.set("contactor", contactorOn);
+    
+    char path[64];
+    snprintf(path, sizeof(path), "/logs/%lu", powerCutTime);
+    Firebase.updateNode(fbdo, path, fbLogJson);
+    
+    pendingPowerOffLog = false; // Successfully logged, clear flag
   }
-  digitalWrite(FAN_PIN, fanOn ? RELAY_ON : RELAY_OFF);
-}
 
-// ==========================
-// Displays & Firebase Write
-// ==========================
-void updateLcd() {
-  unsigned long now = millis();
-  if (now - lastLcdUpdate < LCD_PAGE_TIME) return;
-  lastLcdUpdate = now;
-  lcdPage = (lcdPage + 1) % 5;
-  lcd.clear();
+  if (pendingPowerOnLog)
+  {
+    unsigned long epochTime = (unsigned long)time(nullptr);
+    struct tm *ptm = localtime((time_t*)&epochTime);
+    char timeString[16];
+    strftime(timeString, sizeof(timeString), "%I:%M %p", ptm);
 
-  if (lcdPage == 0) {
-    lcd.setCursor(0, 0); lcd.print(F("GRID:")); lcd.print(stableGridOn ? F("ON ") : F("OFF"));
-    lcd.setCursor(10, 0); lcd.print(F("R:")); lcd.print(rawGridOn ? F("ON") : F("OFF"));
-    lcd.setCursor(0, 1); lcd.print(F("CNT:")); lcd.print(contactorOn ? F("ON ") : F("OFF"));
-    lcd.setCursor(9, 1); lcd.print(batteryOk ? F("BAT OK") : F("BAT LOW"));
-  } else if (lcdPage == 1) {
-    lcd.setCursor(0, 0); lcd.print(F("BATTERY VOLTAGE"));
-    lcd.setCursor(2, 1); 
-    if (sensorFault) { lcd.print(F("SENSOR FAULT!")); } 
-    else { lcd.write(byte(0)); lcd.print(F(" ")); lcd.print(batteryVoltage, 1); lcd.print(F("V")); }
-  } else if (lcdPage == 2) {
-    lcd.setCursor(2, 0); lcd.print(F("Temperature"));
-    lcd.setCursor(0, 1);
-    if (isnan(temperature)) lcd.print(F("Sensor Error"));
-    else { lcd.print(temperature, 1); lcd.print(F(" C ")); lcd.setCursor(9, 1); lcd.print(fanOn ? F("FAN:ON") : F("FAN:OFF")); }
-  } else if (lcdPage == 3) {
-    lcd.setCursor(4, 0); lcd.print(F("Humidity"));
-    lcd.setCursor(6, 1);
-    if (isnan(humidity)) lcd.print(F("Sensor Err"));
-    else { lcd.print(humidity, 0); lcd.print(F(" %")); }
-  } else {
-    lcd.setCursor(3, 0); lcd.print(F("WiFi Status"));
-    lcd.setCursor(2, 1);
-    if (wifiConnected) lcd.print(F("Connected"));
-    else lcd.print(F("Offline Mode"));
-  }
-}
-
-void updateSerial() {
-  unsigned long now = millis();
-  if (now - lastSerialPrint < SERIAL_INTERVAL) return;
-  lastSerialPrint = now;
-  Serial.printf("RAW_GRID=%s | STABLE_GRID=%s | BAT=%.2fV | BAT_OK=%s | TEMP=%.1fC | HUM=%.0f%% | FAN=%s | CNT=%s | WIFI=%s | HEAP=%u\n",
-                rawGridOn ? "ON" : "OFF", stableGridOn ? "ON" : "OFF", batteryVoltage, batteryOk ? "YES" : "NO",
-                temperature, humidity, fanOn ? "ON" : "OFF", contactorOn ? "ON" : "OFF",
-                wifiConnected ? "ON" : "OFF", ESP.getMinFreeHeap());
-}
-
-void logGridEvent() {
-  if (!wifiConnected || !Firebase.ready() || stableGridOn == prevGridState) return;
-  if (!isTimeValid()) return; 
-
-  prevGridState = stableGridOn;
-  time_t eventTime = time(nullptr);
-  unsigned long epochTime = (unsigned long)eventTime;
-  struct tm *ptm = localtime(&eventTime);
-  char timeString[16];
-  strftime(timeString, sizeof(timeString), "%I:%M %p", ptm);
-
-  FirebaseJson eventJson;
-  if (!stableGridOn) {
-    powerCutTime = epochTime;
-    eventJson.set("powerCut", timeString);
-    eventJson.set("restored", "--:--");
-    eventJson.set("duration", "0 Min");
-  } else {
-    eventJson.set("restored", timeString);
-    if (powerCutTime > 0 && epochTime >= powerCutTime) {
+    fbEventJson.clear();
+    fbEventJson.set("powerCut", lastPowerCutStr);
+    fbEventJson.set("restored", timeString);
+    if (powerCutTime > 0 && epochTime >= powerCutTime)
+    {
       char durBuffer[32];
       snprintf(durBuffer, sizeof(durBuffer), "%lu Min", (epochTime - powerCutTime) / 60);
-      eventJson.set("duration", durBuffer);
+      fbEventJson.set("duration", durBuffer);
     }
-  }
+    else
+    {
+      fbEventJson.set("duration", "-- Min");
+    }
+    Firebase.updateNode(fbdo, "/status/gridEvents", fbEventJson);
 
-  // Use writeSuccess logic for cleaner tracking
-  bool writeSuccess = true;
-  writeSuccess &= Firebase.updateNode(fbdo, "/status/gridEvents", eventJson);
+    fbLogJson.clear();
+    fbLogJson.set("event", "POWER_ON");
+    fbLogJson.set("timestamp", (int)epochTime);
+    fbLogJson.set("battery", batteryVoltage);
+    fbLogJson.set("contactor", contactorOn);
 
-  char path[64];
-  snprintf(path, sizeof(path), "/logs/%lu", epochTime);
-  FirebaseJson logJson;
-  logJson.set("event", stableGridOn ? "POWER_ON" : "POWER_OFF");
-  logJson.set("timestamp", (int)epochTime);
-  
-  writeSuccess &= Firebase.updateNode(fbdo, path, logJson);
-  
-  if (!writeSuccess) {
-      firebaseWriteFailCount++;
-  } else {
-      firebaseWriteFailCount = 0;
+    char path[64];
+    snprintf(path, sizeof(path), "/logs/%lu", epochTime);
+    Firebase.updateNode(fbdo, path, fbLogJson);
+
+    pendingPowerOnLog = false; // Successfully logged, clear flag
   }
 }
 
-void sendLiveStatusToFirebase() {
+void sendLiveStatusToFirebase()
+{
   if (!wifiConnected || !Firebase.ready()) return;
 
   unsigned long timestamp = getEpochOrUptime();
-  bool manualOverrideAllowed = stableGridOn || (ALLOW_MANUAL_CONTACTOR_OVERRIDE && batteryVoltage >= MANUAL_OVERRIDE_MIN_VOLTAGE && !sensorFault);
 
-  FirebaseJson statusJson;
-  statusJson.set("battery", batteryVoltage);
-  if (!isnan(temperature)) statusJson.set("temperature", temperature);
-  if (!isnan(humidity)) statusJson.set("humidity", humidity);
-  statusJson.set("fan", fanOn);
-  statusJson.set("contactor", contactorOn);
-  statusJson.set("gridStatus", stableGridOn ? "ONLINE" : "OFFLINE");
-  statusJson.set("timestamp", (int)timestamp);
-  statusJson.set("sensorFault", sensorFault);
+  fbStatusJson.clear();
+  fbStatusJson.set("deviceOnline", true);
+  fbStatusJson.set("wifi", wifiConnected);
+  fbStatusJson.set("firebaseReady", Firebase.ready());
+  fbStatusJson.set("battery", displayVoltage);
+  fbStatusJson.set("batteryControlVoltage", batteryVoltage);
+  if (!isnan(temperature)) fbStatusJson.set("temperature", temperature);
+  if (!isnan(humidity)) fbStatusJson.set("humidity", humidity);
+  fbStatusJson.set("fan", fanOn);
+  fbStatusJson.set("fanReason", getFanReason());
+  fbStatusJson.set("contactor", contactorOn);
+  fbStatusJson.set("contactorReason", getContactorReason());
+  fbStatusJson.set("gridStatus", stableGridOn ? "ONLINE" : "OFFLINE");
+  fbStatusJson.set("rawGrid", rawGridOn ? "ONLINE" : "OFFLINE");
+  fbStatusJson.set("timestamp", (int)timestamp);
+  fbStatusJson.set("sensorFault", sensorFault);
+  fbStatusJson.set("batteryOk", batteryOk);
 
-  FirebaseJson systemJson;
-  systemJson.set("wifiSSID", WiFi.SSID());
-  systemJson.set("wifiRSSI", WiFi.RSSI());
-  systemJson.set("minFreeHeap", ESP.getMinFreeHeap()); 
-  systemJson.set("uptimeSec", (int)getUptimeSeconds());
-  systemJson.set("firmware", "v4.0.0-final");
-  systemJson.set("timeValid", isTimeValid());
-  systemJson.set("controlFanManual", controlFanManual);
-  systemJson.set("controlContactorManual", controlContactorManual);
-  systemJson.set("manualContactorOverrideAllowed", manualOverrideAllowed);
-  systemJson.set("lastResetReason", systemResetReason);
-  systemJson.set("brownoutCount", brownoutCount);
-  systemJson.set("cycles", contactorCycles);
-  systemJson.set("maxLoopUs", (int)maxLoopTimeUs);
-
-  // [FIX] Avoid updating Root `/`, update `/status` and `/system` safely
-  bool writeSuccess = true;
-  writeSuccess &= Firebase.updateNode(fbdo, "/status", statusJson);
-  writeSuccess &= Firebase.updateNode(fbdo, "/system", systemJson);
-
-  if (writeSuccess) {
-      firebaseWriteFailCount = 0;
-      maxLoopTimeUs = 0; 
-  } else {
-      firebaseWriteFailCount++;
-      printFirebaseError("Live Status Sync");
+  if (Firebase.updateNode(fbdo, "/status", fbStatusJson))
+  {
+    firebaseWriteFailCount = 0;
   }
-
-  if (firebaseWriteFailCount > 50) {
-      safeRestart(F("[FIREBASE] Write Deadlock. Rebooting..."));
+  else
+  {
+    firebaseWriteFailCount++;
+    printFirebaseError("Live Status Sync");
   }
 }
 
-void sendHistoryToFirebase() {
+void sendSystemToFirebase()
+{
+  if (!wifiConnected || !Firebase.ready()) return;
+
+  bool manualOverrideAllowed =
+    stableGridOn ||
+    (ALLOW_MANUAL_CONTACTOR_OVERRIDE &&
+     batteryVoltage >= MANUAL_OVERRIDE_MIN_VOLTAGE &&
+     !sensorFault);
+
+  fbSystemJson.clear();
+  fbSystemJson.set("wifiSSID", WiFi.SSID());
+  fbSystemJson.set("wifiRSSI", WiFi.RSSI());
+  fbSystemJson.set("freeHeap", ESP.getFreeHeap());
+  fbSystemJson.set("minFreeHeap", ESP.getMinFreeHeap());
+  fbSystemJson.set("uptimeSec", (int)getUptimeSeconds());
+  fbSystemJson.set("firmware", "v4.2.0-industrial"); // Updated firmware version
+  fbSystemJson.set("timeValid", isTimeValid());
+  fbSystemJson.set("wifi", wifiConnected);
+  fbSystemJson.set("firebaseReady", Firebase.ready());
+  fbSystemJson.set("controlFanManual", controlFanManual);
+  fbSystemJson.set("controlContactorManual", controlContactorManual);
+  fbSystemJson.set("manualContactorOverrideAllowed", manualOverrideAllowed);
+  fbSystemJson.set("lastResetReason", systemResetReason);
+  fbSystemJson.set("brownoutCount", brownoutCount);
+  fbSystemJson.set("cycles", contactorCycles);
+  fbSystemJson.set("maxLoopUs", (int)maxLoopTimeUs);
+
+  if (Firebase.updateNode(fbdo, "/system", fbSystemJson))
+  {
+    firebaseWriteFailCount = 0;
+    maxLoopTimeUs = 0;
+  }
+  else
+  {
+    firebaseWriteFailCount++;
+    printFirebaseError("System Sync");
+  }
+}
+
+void sendHistoryToFirebase()
+{
   if (!wifiConnected || !Firebase.ready()) return;
   if (!isTimeValid()) return;
 
   unsigned long epochTime = (unsigned long)time(nullptr);
+
   char historyPath[64];
   snprintf(historyPath, sizeof(historyPath), "/history/%lu", epochTime);
 
-  FirebaseJson historyJson;
-  historyJson.set("battery", batteryVoltage);
-  if (!isnan(temperature)) historyJson.set("temperature", temperature);
-  if (!isnan(humidity)) historyJson.set("humidity", humidity);
-  historyJson.set("grid", stableGridOn ? "ONLINE" : "OFFLINE");
+  fbHistoryJson.clear();
+  fbHistoryJson.set("battery", displayVoltage);
+  fbHistoryJson.set("batteryControlVoltage", batteryVoltage);
+  if (!isnan(temperature)) fbHistoryJson.set("temperature", temperature);
+  if (!isnan(humidity)) fbHistoryJson.set("humidity", humidity);
+  fbHistoryJson.set("grid", stableGridOn ? "ONLINE" : "OFFLINE");
+  fbHistoryJson.set("fan", fanOn);
+  fbHistoryJson.set("contactor", contactorOn);
+  fbHistoryJson.set("fanReason", getFanReason());
+  fbHistoryJson.set("contactorReason", getContactorReason());
 
-  if (!Firebase.updateNode(fbdo, historyPath, historyJson)) {
-      firebaseWriteFailCount++;
-  } else {
-      firebaseWriteFailCount = 0;
+  if (Firebase.updateNode(fbdo, historyPath, fbHistoryJson))
+  {
+    firebaseWriteFailCount = 0;
+  }
+  else
+  {
+    firebaseWriteFailCount++;
+  }
+}
+
+void runCloudTasks()
+{
+  maintainWiFi();
+  enforceControlTimeout();
+
+  readFirebaseControls();
+  logGridEvent();
+
+  unsigned long now = millis();
+
+  if (now - lastFirebaseLiveUpdate >= FIREBASE_LIVE_INTERVAL)
+  {
+    lastFirebaseLiveUpdate = now;
+    sendLiveStatusToFirebase();
+  }
+
+  if (now - lastFirebaseSystemUpdate >= FIREBASE_SYSTEM_INTERVAL)
+  {
+    lastFirebaseSystemUpdate = now;
+    sendSystemToFirebase();
+  }
+
+  if (now - lastFirebaseHistoryUpdate >= FIREBASE_HISTORY_INTERVAL)
+  {
+    lastFirebaseHistoryUpdate = now;
+    sendHistoryToFirebase();
+  }
+
+  // Cloud freeze detection: Reboots if internet drops but WiFi remains connected.
+  if (firebaseWriteFailCount > 200)
+  {
+    safeRestart(F("[NETWORK] Severe cloud sync freeze detected. Triggering recovery reboot."));
   }
 }
 
 // ==========================
-// Setup
+// User Interface (LCD & Serial)
 // ==========================
-void setup() {
+void updateLcd()
+{
+  unsigned long now = millis();
+  if (now - lastLcdUpdate < LCD_PAGE_TIME) return;
+
+  lastLcdUpdate = now;
+  lcdPage = (lcdPage + 1) % 5;
+
+  lcd.clear();
+
+  if (lcdPage == 0)
+  {
+    lcd.setCursor(0, 0);
+    lcd.print(F("GRID:"));
+    lcd.print(stableGridOn ? F("ON ") : F("OFF"));
+
+    lcd.setCursor(10, 0);
+    lcd.print(F("R:"));
+    lcd.print(rawGridOn ? F("ON") : F("OFF"));
+
+    lcd.setCursor(0, 1);
+    lcd.print(F("CNT:"));
+    lcd.print(contactorOn ? F("ON ") : F("OFF"));
+
+    lcd.setCursor(9, 1);
+    lcd.print(batteryOk ? F("BAT OK") : F("BAT LOW"));
+  }
+  else if (lcdPage == 1)
+  {
+    lcd.setCursor(0, 0);
+    lcd.print(F("BATTERY VOLT"));
+
+    lcd.setCursor(0, 1);
+    if (sensorFault)
+    {
+      lcd.print(F("SENSOR FAULT"));
+    }
+    else
+    {
+      lcd.write(byte(0));
+      lcd.print(F(" "));
+      lcd.print(displayVoltage, 1);
+      lcd.print(F("V"));
+    }
+  }
+  else if (lcdPage == 2)
+  {
+    lcd.setCursor(2, 0);
+    lcd.print(F("Temperature"));
+
+    lcd.setCursor(0, 1);
+    if (isnan(temperature))
+    {
+      lcd.print(F("Sensor Error"));
+    }
+    else
+    {
+      lcd.print(temperature, 1);
+      lcd.print(F(" C "));
+      lcd.setCursor(9, 1);
+      lcd.print(fanOn ? F("FAN:ON") : F("FAN:OFF"));
+    }
+  }
+  else if (lcdPage == 3)
+  {
+    lcd.setCursor(4, 0);
+    lcd.print(F("Humidity"));
+
+    lcd.setCursor(4, 1);
+    if (isnan(humidity))
+    {
+      lcd.print(F("Sensor Err"));
+    }
+    else
+    {
+      lcd.print(humidity, 0);
+      lcd.print(F(" %"));
+    }
+  }
+  else
+  {
+    lcd.setCursor(3, 0);
+    lcd.print(F("WiFi Status"));
+
+    lcd.setCursor(2, 1);
+    lcd.print(wifiConnected ? F("Connected") : F("Offline Mode"));
+  }
+}
+
+void updateSerial()
+{
+  unsigned long now = millis();
+  if (now - lastSerialPrint < SERIAL_INTERVAL) return;
+
+  lastSerialPrint = now;
+
+  Serial.printf(
+    "RAW_GRID=%s | STABLE_GRID=%s | BAT=%.2fV | BAT_OK=%s | TEMP=%.1fC | HUM=%.0f%% | FAN=%s | CNT=%s | WIFI=%s | HEAP=%u | MIN_HEAP=%u\n",
+    rawGridOn ? "ON" : "OFF",
+    stableGridOn ? "ON" : "OFF",
+    batteryVoltage,
+    batteryOk ? "YES" : "NO",
+    temperature,
+    humidity,
+    fanOn ? "ON" : "OFF",
+    contactorOn ? "ON" : "OFF",
+    wifiConnected ? "ON" : "OFF",
+    ESP.getFreeHeap(),
+    ESP.getMinFreeHeap()
+  );
+}
+
+// ==========================
+// Main Initialization (Setup)
+// ==========================
+void setup()
+{
   Serial.begin(115200);
   delay(500);
 
-  // [FIX] Correct Brownout API Mix-up
   esp_reset_reason_t resetReason = esp_reset_reason();
   if (resetReason == ESP_RST_BROWNOUT) brownoutCount++;
   systemResetReason = (int)resetReason;
-  
-  Serial.printf("\n[INIT] ESP32 Booting... Reset Reason: %d\n", systemResetReason);
 
-  esp_task_wdt_init(30, true);
-  esp_task_wdt_add(NULL);
+  Serial.printf("\n[INIT] ESP32 Booting. Reset Reason Code: %d\n", systemResetReason);
+
+  setupWatchdog();
 
   pinMode(GRID_PIN, INPUT_PULLUP);
   pinMode(CONTACTOR_PIN, OUTPUT);
   pinMode(FAN_PIN, OUTPUT);
 
-  // Absolute Safe Boot
   digitalWrite(CONTACTOR_PIN, RELAY_OFF);
   digitalWrite(FAN_PIN, RELAY_OFF);
   contactorOn = false;
+  fanOn = false;
+  lastContactorOffAt = millis();
 
   analogReadResolution(12);
   analogSetPinAttenuation(VOLTAGE_PIN, ADC_11db);
@@ -572,126 +973,131 @@ void setup() {
   lcd.createChar(0, batteryIcon);
   dht.begin();
 
-  WiFi.mode(WIFI_STA);
-  WiFi.setAutoReconnect(true);
-  WiFi.persistent(false);
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-
   lcd.clear();
-  lcd.setCursor(2, 0); lcd.print(F("Connecting"));
-  lcd.setCursor(4, 1); lcd.print(F("WiFi..."));
-
-  unsigned long wifiStart = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - wifiStart < 10000) {
-    delay(250);
-    Serial.print(".");
-    esp_task_wdt_reset(); 
-  }
-
-  wifiConnected = (WiFi.status() == WL_CONNECTED);
-  if (wifiConnected) {
-    Serial.println(F("\n[NETWORK] WiFi connected."));
-  } else {
-    Serial.println(F("\n[NETWORK] Timeout. Operating in offline mode."));
-  }
-
-  configTime(19800, 0, "pool.ntp.org", "time.nist.gov");
-
-  if (wifiConnected) {
-    Serial.print(F("[NETWORK] Waiting for NTP Sync..."));
-    for (int i = 0; i < 20; i++) {
-      if (isTimeValid()) break;
-      delay(500);
-      Serial.print(".");
-      esp_task_wdt_reset(); 
-    }
-    Serial.println();
-    lastNtpSync = millis();
-  }
-
-  config.api_key = API_KEY;
-  config.database_url = DATABASE_URL;
-
-  if (wifiConnected) {
-    Firebase.signUp(&config, &auth, "", "");
-    Firebase.begin(&config, &auth);
-    Firebase.reconnectWiFi(true);
-  }
-
-  lastLcdUpdate = millis() - LCD_PAGE_TIME;
+  lcd.setCursor(2, 0);
+  lcd.print(F("SMART HOME"));
+  lcd.setCursor(1, 1);
+  lcd.print(F("Local First"));
 
   rawGridOn = digitalRead(GRID_PIN) == GRID_ON_LEVEL;
   lastRawGridOn = rawGridOn;
-  stableGridOn = false; 
+  stableGridOn = false;
   prevGridState = false;
   rawGridChangedAt = millis();
 
   batteryVoltage = readBatteryVoltage();
+  displayVoltage = batteryVoltage;
   prevBatteryVoltage = batteryVoltage;
-  filteredVoltage = batteryVoltage; 
   
-  sensorFault = (batteryVoltage < 5.0 || batteryVoltage > 35.0);
-  if (!sensorFault) { batteryOk = batteryVoltage >= BATTERY_RECOVER; }
-  
+  // Stricter safety limits applied upon boot
+  sensorFault = (batteryVoltage < 10.0 || batteryVoltage > 35.0);
+  batteryOk = !sensorFault && batteryVoltage >= BATTERY_RECOVER;
+
   temperature = dht.readTemperature();
   humidity = dht.readHumidity();
 
   updateContactor();
   updateExhaustFan();
 
-  Serial.println(F("[INIT] Setup complete. System Live."));
+  WiFi.mode(WIFI_STA);
+  WiFi.setAutoReconnect(true);
+  WiFi.persistent(false);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+
+  lcd.clear();
+  lcd.setCursor(2, 0);
+  lcd.print(F("Connecting"));
+  lcd.setCursor(4, 1);
+  lcd.print(F("WiFi..."));
+
+  unsigned long wifiStart = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - wifiStart < 10000)
+  {
+    esp_task_wdt_reset();
+    runLocalControl();
+    delay(250);
+    Serial.print(".");
+  }
+
+  wifiConnected = (WiFi.status() == WL_CONNECTED);
+  previousWiFiState = wifiConnected;
+  Serial.println(wifiConnected ? F("\n[NETWORK] WiFi successfully connected.") : F("\n[NETWORK] Operating in offline fallback mode."));
+
+  configTime(19800, 0, "pool.ntp.org", "time.nist.gov");
+
+  if (wifiConnected)
+  {
+    Serial.print(F("[NETWORK] Waiting for NTP Time Synchronization..."));
+    for (int i = 0; i < 20; i++)
+    {
+      esp_task_wdt_reset();
+      runLocalControl();
+      if (isTimeValid()) break;
+      delay(500);
+      Serial.print(".");
+    }
+    Serial.println();
+  }
+
+  lastNtpSync = millis();
+
+  config.api_key = API_KEY;
+  config.database_url = DATABASE_URL;
+
+  if (wifiConnected)
+  {
+    // Configure Email/Password Authentication
+    auth.user.email = FIREBASE_EMAIL;
+    auth.user.password = FIREBASE_PASSWORD;
+
+    Firebase.begin(&config, &auth);
+    Firebase.reconnectWiFi(true);
+    
+    Serial.println(F("[FIREBASE] Initiating connection via Email/Password Auth..."));
+  }
+
+  lastLcdUpdate = millis() - LCD_PAGE_TIME;
+  lastFirebaseLiveUpdate = millis();
+  lastFirebaseSystemUpdate = millis();
+  lastFirebaseHistoryUpdate = millis();
+
+  Serial.println(F("[INIT] System initialization complete. Services are live."));
 }
 
 // ==========================
 // Main Execution Loop
 // ==========================
-void loop() {
+void loop()
+{
   unsigned long loopStart = micros();
-  esp_task_wdt_reset(); 
+  esp_task_wdt_reset();
 
-  if (ESP.getMinFreeHeap() < 15000) {
-      safeRestart(F("[SYSTEM] Critical Low Heap. Auto-Healing Reboot..."));
+  // Updated: Increased critical heap threshold to 30,000 bytes for higher stability
+  if (ESP.getFreeHeap() < 30000)
+  {
+    safeRestart(F("[SYSTEM] Critical memory shortage detected. Triggering safe reboot."));
   }
 
-  if (getUptimeSeconds() > THIRTY_DAYS_SECONDS) { 
-      safeRestart(F("[SYSTEM] 30-Day Scheduled Maintenance Reboot."));
+  if (getUptimeSeconds() > THIRTY_DAYS_SECONDS)
+  {
+    safeRestart(F("[SYSTEM] Executing scheduled 30-day maintenance reboot."));
   }
 
-  if (millis() - lastNtpSync > NTP_SYNC_INTERVAL) {
-      configTime(19800, 0, "pool.ntp.org", "time.nist.gov");
-      lastNtpSync = millis();
+  if (millis() - lastNtpSync > NTP_SYNC_INTERVAL)
+  {
+    configTime(19800, 0, "pool.ntp.org", "time.nist.gov");
+    lastNtpSync = millis();
   }
 
-  maintainWiFi();          
-  enforceControlTimeout(); 
-
-  updateGridStatus();
-  logGridEvent();
-
-  updateBatteryStatus();
-  updateDhtStatus();
-  readFirebaseControls();  
-
-  updateContactor();       
-  updateExhaustFan();
+  runLocalControl();
+  runCloudTasks();
+  runLocalControl();
 
   updateLcd();
   updateSerial();
 
-  unsigned long now = millis();
-
-  if (now - lastFirebaseLiveUpdate >= FIREBASE_LIVE_INTERVAL) {
-    lastFirebaseLiveUpdate = now;
-    sendLiveStatusToFirebase();
-  }
-
-  if (now - lastFirebaseHistoryUpdate >= FIREBASE_HISTORY_INTERVAL) {
-    lastFirebaseHistoryUpdate = now;
-    sendHistoryToFirebase(); 
-  }
-
   unsigned long loopTime = micros() - loopStart;
-  if(loopTime > maxLoopTimeUs) maxLoopTimeUs = loopTime;
+  if (loopTime > maxLoopTimeUs) maxLoopTimeUs = loopTime;
 
-  yield(); 
+  yield();
 }
